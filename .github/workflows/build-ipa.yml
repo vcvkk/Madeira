@@ -38,7 +38,7 @@ jobs:
       - name: Install build deps
         run: |
           set -euo pipefail
-          brew install cmake ninja flex bison pkg-config python3 coreutils || true
+          brew install cmake ninja flex bison pkg-config python3 coreutils sevenzip || true
           python3 -m pip install --break-system-packages --user packaging setuptools || true
           echo "/opt/homebrew/opt/bison/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/opt/flex/bin" >> "$GITHUB_PATH"
@@ -54,8 +54,6 @@ jobs:
           mkdir -p FEX/build-ios/External/fmt FEX/build-ios/External/cephes
           mkdir -p FEX/build-ios/External/xxhash/cmake_unofficial FEX/build-ios/External/SoftFloat-3e
 
-          # Public artifacts from ITZproVenom/GameHub-iOS (same Madeira fork lineage).
-          # ntdll + wineserver + FEX set (~7MB) and DXMT (~36MB).
           download_artifact() {
             local owner=$1 repo=$2 run_id=$3 art_name=$4 dest=$5
             echo "Downloading $art_name from $owner/$repo run $run_id..."
@@ -69,7 +67,6 @@ jobs:
           download_artifact ITZproVenom GameHub-iOS 34956261160 madeira-host-libs /tmp/prebuilt/core || true
           download_artifact ITZproVenom GameHub-iOS 36042687853 madeira-host-libs /tmp/prebuilt/dxmt || true
 
-          # Place core libs
           for f in libntdll_unix.a libwineserver.a; do
             [ -f /tmp/prebuilt/core/$f ] && cp -v /tmp/prebuilt/core/$f app/Madeira/
           done
@@ -80,14 +77,12 @@ jobs:
           [ -f /tmp/prebuilt/core/fex/libxxhash.a ] && cp -v /tmp/prebuilt/core/fex/libxxhash.a FEX/build-ios/External/xxhash/cmake_unofficial/
           [ -f /tmp/prebuilt/core/fex/libsoftfloat_3e.a ] && cp -v /tmp/prebuilt/core/fex/libsoftfloat_3e.a FEX/build-ios/External/SoftFloat-3e/
 
-          # Jemalloc: often linked as empty/stub if FEX built without it — create thin archive of empty object
           if [ ! -f FEX/build-ios/FEXCore/Source/libJemallocLibs.a ]; then
             echo 'void madeira_jemalloc_stub(void){}' | xcrun -sdk iphoneos clang -arch arm64 -c -x c - -o /tmp/jemalloc_stub.o
             ar rcs FEX/build-ios/FEXCore/Source/libJemallocLibs.a /tmp/jemalloc_stub.o
             echo "created stub libJemallocLibs.a"
           fi
 
-          # DXMT
           if [ -f /tmp/prebuilt/dxmt/libdxmt_combined.a ]; then
             cp -v /tmp/prebuilt/dxmt/libdxmt_combined.a app/Madeira/
           elif [ -f /tmp/prebuilt/dxmt/libdxmt_unix.a ]; then
@@ -96,6 +91,47 @@ jobs:
 
           echo "=== Prebuilt placement ==="
           find app/Madeira FEX/build-ios -name '*.a' -exec ls -lh {} \; 2>/dev/null || true
+
+      - name: Provide x86_64-vcruntime (VC++ redistributable)
+        run: |
+          set -euo pipefail
+          DEST=app/Madeira/x86_64-vcruntime
+          mkdir -p "$DEST"
+          # Always ensure the folder exists (Xcode CpResource fails if missing).
+          # Try to extract official MSVC x64 redist DLLs for completeness.
+          if [ -z "$(ls -A "$DEST" 2>/dev/null)" ]; then
+            brew install sevenzip 2>/dev/null || true
+            TMP=/tmp/vcredist
+            mkdir -p "$TMP"
+            # Microsoft Visual C++ 2015-2022 Redistributable (x64)
+            curl -fsSL -o "$TMP/VC_redist.x64.exe" \
+              "https://aka.ms/vs/17/release/vc_redist.x64.exe" || true
+            if [ -s "$TMP/VC_redist.x64.exe" ]; then
+              7zz x "$TMP/VC_redist.x64.exe" -o"$TMP/ex" -y || true
+              # CABINET layout varies; search for known DLLs
+              find "$TMP" -iname 'vcruntime140*.dll' -o -iname 'msvcp140*.dll' -o -iname 'concrt140.dll' -o -iname 'vcomp140.dll' -o -iname 'vcamp140.dll' -o -iname 'vccorlib140.dll' 2>/dev/null | while read -r f; do
+                cp -v "$f" "$DEST/" || true
+              done
+              # Also expand nested CABs if present
+              find "$TMP/ex" -iname '*.cab' 2>/dev/null | while read -r cab; do
+                7zz x "$cab" -o"$TMP/cab" -y >/dev/null 2>&1 || true
+              done
+              find "$TMP/cab" -iname '*.dll' 2>/dev/null | while read -r f; do
+                base=$(basename "$f" | tr '[:upper:]' '[:lower:]')
+                case "$base" in
+                  concrt140.dll|msvcp140*.dll|vcruntime140*.dll|vcamp140.dll|vccorlib140.dll|vcomp140.dll)
+                    cp -v "$f" "$DEST/" || true
+                    ;;
+                esac
+              done
+            fi
+          fi
+          # Placeholder so the resource folder is never empty if extract failed
+          if [ -z "$(ls -A "$DEST" 2>/dev/null)" ]; then
+            echo "VC redist extract empty — leaving placeholder .gitkeep"
+            touch "$DEST/.gitkeep"
+          fi
+          ls -la "$DEST"
 
       - name: Build libwin32u_unix.a (if missing)
         continue-on-error: true
@@ -110,7 +146,6 @@ jobs:
             echo "wine submodule missing — cannot build win32u"
             exit 0
           fi
-          # Minimal wine config.h for iOS compiles
           mkdir -p wine/build-macos/include
           if [ ! -f wine/build-macos/include/config.h ]; then
             {
@@ -131,7 +166,6 @@ jobs:
               echo '#endif'
             } > wine/build-macos/include/config.h
           fi
-          # Prefer project script; tolerate partial failure and still ar what we have
           set +e
           bash build/win32u-unix/build.sh 2>&1 | tee /tmp/win32u.log | tail -80
           set -e
@@ -139,13 +173,15 @@ jobs:
             ls -lh app/Madeira/libwin32u_unix.a
             exit 0
           fi
-          # Fallback: archive any objects produced
           OBJ=build/win32u-unix/obj
           if [ -d "$OBJ" ] && [ "$(find "$OBJ" -name '*.o' | wc -l | tr -d ' ')" -gt 0 ]; then
             find "$OBJ" -name '*.o' -print0 | xargs -0 ar rcs app/Madeira/libwin32u_unix.a
             ls -lh app/Madeira/libwin32u_unix.a
           else
-            echo "win32u still missing — link may fail"
+            # Last resort: empty stub so link gets past -lwin32u_unix path existence
+            echo 'void madeira_win32u_stub(void){}' | xcrun -sdk iphoneos clang -arch arm64 -c -x c - -o /tmp/win32u_stub.o
+            ar rcs app/Madeira/libwin32u_unix.a /tmp/win32u_stub.o
+            echo "created stub libwin32u_unix.a — app may not run games"
           fi
 
       - name: Inventory libs before xcodebuild
@@ -161,6 +197,7 @@ jobs:
             app/Madeira/libwineserver.a \
             app/Madeira/libwin32u_unix.a \
             app/Madeira/libdxmt_combined.a \
+            app/Madeira/x86_64-vcruntime \
             FEX/build-ios/FEXCore/Source/libFEXCore.a \
             FEX/build-ios/FEXCore/Source/libFEXCore_Base.a \
             FEX/build-ios/FEXCore/Source/libJemallocLibs.a \
@@ -169,7 +206,7 @@ jobs:
             FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a \
             FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a
           do
-            if [ -f "$p" ]; then ls -lh "$p"; else echo "MISSING $p"; fi
+            if [ -e "$p" ]; then ls -ldh "$p"; else echo "MISSING $p"; fi
           done
 
       - name: List schemes
@@ -229,7 +266,8 @@ jobs:
             echo ""
             echo "- Configuration: \`${{ github.event.inputs.configuration || 'Debug' }}\`"
             echo "- Artifact: \`${{ env.IPA_NAME || 'n/a' }}\`"
-            echo "- Host libs: pulled from GameHub CI + local win32u build attempt"
+            echo "- Host libs: GameHub artifacts + win32u/jemalloc stubs if needed"
+            echo "- x86_64-vcruntime: extracted from VC_redist.x64.exe when possible"
             echo "- Unsigned — re-sign (Feather / AltStore) before install"
             echo ""
             ls -lh "${{ env.IPA_NAME }}" 2>/dev/null || echo "(no IPA)"
