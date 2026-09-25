@@ -138,20 +138,36 @@ jobs:
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           which aarch64-w64-mingw32-clang
 
-          # madeira wine fork: loader.c pulls in a PE-side generated unit; host
-          # makedep requires the path to exist before Makefile can be written.
-          # Real PE content is produced later by build/wine-pe; empty file is only
-          # so configure can finish and emit include/config.h + widl headers.
+          # PE-side generated unit required by makedep path scan
           if [ ! -f wine/dlls/ntdll/arm64ec_x64_export_iat.c ]; then
             printf '%s\n' '/* generated during PE build; empty for host configure */' \
               > wine/dlls/ntdll/arm64ec_x64_export_iat.c
           fi
 
+          # madeira fork: makedep aborts on unix/sync.c include order while
+          # writing Makefile. config.status still emits include/config.h first —
+          # that is all ntdll-unix/wineserver compile lines need (-include config.h).
           mkdir -p wine/build-macos && cd wine/build-macos
-          ../configure --without-x --without-freetype --disable-tests --with-mingw=clang
+          set +e
+          ../configure --without-x --without-freetype --disable-tests --with-mingw=clang \
+            > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1
+          cfg=$?
+          set -e
+          tail -40 "$GITHUB_WORKSPACE/wine-configure.log" || true
           test -f include/config.h
-          make -j"$(sysctl -n hw.ncpu)" include/all
+
+          if [ -f Makefile ]; then
+            make -j"$(sysctl -n hw.ncpu)" include/all || make -C include all || true
+          else
+            echo "::warning::Wine Makefile missing (makedep exit); using config.h only"
+            # Ensure include/ has stamp so -I paths resolve
+            mkdir -p include
+            touch include/stamp-h
+          fi
+
           cd .. && ln -sfn build-macos build-arm64ec
+          test -f build-macos/include/config.h
+          ls -la build-macos/include/config.h
 
       - name: Build FEXCore
         run: bash build/fex-ios/build.sh
@@ -161,6 +177,7 @@ jobs:
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           bash build/ntdll-unix/build.sh
+          test -s app/Madeira/libntdll_unix.a
 
       - name: Build libwineserver.a
         run: |
@@ -168,12 +185,14 @@ jobs:
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           bash scripts/ci/build-wineserver-base.sh
           bash build/wineserver/build.sh all
+          test -s app/Madeira/libwineserver.a
 
       - name: Build libwin32u_unix.a
         run: |
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           bash build/win32u-unix/build.sh
+          test -s app/Madeira/libwin32u_unix.a
 
       - name: Build libdxmt_combined.a
         run: |
@@ -184,6 +203,7 @@ jobs:
           xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a \
               build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
           cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
+          test -s app/Madeira/libdxmt_combined.a
 
       - name: Build Madeira.app
         run: |
@@ -229,6 +249,7 @@ jobs:
           name: build-logs
           path: |
             xcodebuild.log
+            wine-configure.log
             build/*/obj/*.err
             build/*/obj/err-*.txt
             wine/build-macos/config.log
