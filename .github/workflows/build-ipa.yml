@@ -1,0 +1,129 @@
+name: Build IPA (unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Xcode configuration (Debug is what runs games per docs/BUILDING.md)"
+        required: false
+        default: "Debug"
+        type: choice
+        options:
+          - Debug
+          - Release
+
+jobs:
+  build-ipa:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Show environment
+        run: |
+          xcodebuild -version
+          sw_vers
+          df -h .
+
+      - name: Check required static libraries
+        id: libs
+        run: |
+          set -e
+          MISSING=0
+          check() {
+            if [ ! -f "$1" ]; then
+              echo "::warning::Missing: $1"
+              MISSING=1
+            else
+              ls -lh "$1"
+            fi
+          }
+          # Tracked in repo
+          check app/Madeira/libgmp.a
+          check app/Madeira/libgnutls.a
+          check app/Madeira/libhogweed.a
+          check app/Madeira/libnettle.a
+          # Gitignored — must be built locally or supplied
+          check app/Madeira/libntdll_unix.a
+          check app/Madeira/libwineserver.a
+          check app/Madeira/libwin32u_unix.a
+          check app/Madeira/libdxmt_combined.a
+          check FEX/build-ios/FEXCore/Source/libFEXCore.a
+          check FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
+          check FEX/build-ios/FEXCore/Source/libJemallocLibs.a
+          if [ "$MISSING" = "1" ]; then
+            echo ""
+            echo "::error::Required static libraries are missing (see docs/BUILDING.md)."
+            echo "These .a files are gitignored and must be built with the native chains"
+            echo "(build/*/build.sh) or uploaded as artifacts before CI can produce an IPA."
+            echo "Continuing will fail at link time."
+            exit 1
+          fi
+
+      - name: List schemes
+        run: |
+          xcodebuild -project app/Madeira.xcodeproj -list
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          CONFIG="${{ github.event.inputs.configuration || 'Debug' }}"
+          echo "Configuration: $CONFIG"
+          xcodebuild archive \
+            -project app/Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration "$CONFIG" \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Madeira.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Package IPA
+        run: |
+          set -e
+          APP_PATH=$(find build/Madeira.xcarchive -name "Madeira.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Madeira.app not found in archive"
+            find build/Madeira.xcarchive -type f | head -40
+            exit 1
+          fi
+          echo "Found: $APP_PATH"
+          ls -lh "$APP_PATH"
+          CONFIG="${{ github.event.inputs.configuration || 'Debug' }}"
+          IPA_NAME="Madeira-${CONFIG}-${{ github.run_number }}.ipa"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r -q "$IPA_NAME" Payload
+          rm -rf Payload
+          ls -lh "$IPA_NAME"
+          echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-ipa
+          path: ${{ env.IPA_NAME }}
+          retention-days: 14
+
+      - name: Summary
+        run: |
+          {
+            echo "## Madeira IPA"
+            echo ""
+            echo "- Configuration: \`${{ github.event.inputs.configuration || 'Debug' }}\`"
+            echo "- Artifact: \`${{ env.IPA_NAME }}\`"
+            echo "- Unsigned — re-sign with your cert (e.g. Feather / AltStore) before install"
+            echo ""
+            ls -lh "${{ env.IPA_NAME }}" || true
+          } >> "$GITHUB_STEP_SUMMARY"
