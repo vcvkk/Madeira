@@ -47,6 +47,11 @@ jobs:
           sudo xcode-select -s "$X/Contents/Developer"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+          # DXMT's airconv shaders need the Metal compiler, a separate
+          # download since Xcode 26.
+          xcrun -sdk macosx metal --version 2>/dev/null \
+            || sudo xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
 
       - name: Host tools
         run: |

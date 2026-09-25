@@ -17,6 +17,19 @@ OUT_LIB="$BUILD_DIR/libdxmt_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
+# airconv embeds three Metal helper libraries as byte arrays. DXMT's meson build
+# generates the headers (metal -> .air -> xxd -i); regenerate any that are
+# missing so a clean checkout builds without a prior meson run.
+mkdir -p "$BUILD_DIR/shader-headers"
+for s in air_msad air_samplepos air_tessellation; do
+    h="$BUILD_DIR/shader-headers/$s.h"
+    [ -f "$h" ] && continue
+    echo "  generating $s.h"
+    xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+        -c "$DXMT_SRC/airconv/shaders/$s.metal" -o "$OBJ_DIR/$s.air"
+    (cd "$OBJ_DIR" && xxd -n "$s" -i "$s.air" "$h")
+done
+
 COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks -O2"
 INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"
