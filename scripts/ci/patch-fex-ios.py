@@ -49,3 +49,20 @@ def core(t):
 
 
 patch("FEXCore/Source/Interface/Core/Core.cpp", core)
+
+
+# IosLogUnimplementedCASPAL describes the faulting region with VirtualQuery,
+# a Win32 API that only exists in the ARM64EC PE build.
+def caspal(t):
+    start = "  MEMORY_BASIC_INFORMATION mbi {};\n"
+    end = "                    mbi.Protect, type, mbi.State);\n"
+    if t.count(start) != 1 or t.count(end) != 1:
+        return t
+    t = t.replace(start, f"#ifdef _WIN32 {MARK}\n" + start)
+    return t.replace(end, end + "#else\n"
+                     "  LogMan::Msg::EFmt(\"[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={}\",\n"
+                     "                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15);\n"
+                     "#endif\n")
+
+
+patch("FEXCore/Source/Utils/ArchHelpers/Arm64.cpp", caspal)

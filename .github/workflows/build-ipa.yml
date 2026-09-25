@@ -192,7 +192,12 @@ jobs:
           # Ensure packaging is importable for FEX scripts
           python3 -c "import packaging; print(packaging.__version__)"
           python3 scripts/ci/patch-fex-ios.py
-          bash build/fex-ios/build.sh
+          bash build/fex-ios/build.sh || {
+            # Keep going past the first failure so one run lists every error.
+            cmake --build FEX/build-ios --target FEXCore FEXCore_Base JemallocLibs -- -k 0 2>&1 \
+              | grep -E "error:|FAILED" | head -150
+            exit 1
+          }
 
       - name: Build libntdll_unix.a
         run: |
