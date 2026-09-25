@@ -8,6 +8,8 @@ B="$R/FEX/build-ios"
 if [ ! -f "$B/CMakeCache.txt" ]; then
     # iOS toolchain leaves CMAKE_SYSTEM_PROCESSOR empty; FEX CMakeLists
     # rejects that ("Unsupported processor type"). Force arm64.
+    # TUNE_CPU=none: the default "native" probes the build host's
+    # /proc/cpuinfo, which does not exist on macOS and is not the device.
     cmake -S "$R/FEX" -B "$B" \
         -G Ninja \
         -DCMAKE_SYSTEM_NAME=iOS \
@@ -23,7 +25,8 @@ if [ ! -f "$B/CMakeCache.txt" ]; then
         -DENABLE_FEX_ALLOCATOR=OFF \
         -DENABLE_ASSERTIONS=OFF \
         -DENABLE_CLANG_THUNKS=ON \
-        -DENABLE_CCACHE=ON
+        -DENABLE_CCACHE=ON \
+        -DTUNE_CPU=none
 fi
-cmake --build "$B" --target FEXCore FEXCore_Base -j"$(sysctl -n hw.ncpu)"
+cmake --build "$B" --target FEXCore FEXCore_Base JemallocLibs -j"$(sysctl -n hw.ncpu)"
 ls "$B/FEXCore/Source/"*.a
