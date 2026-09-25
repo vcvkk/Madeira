@@ -9,20 +9,35 @@ on:
 jobs:
   build-ipa:
     name: Build host libs + unsigned IPA
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 180
 
     steps:
+      - name: Select Xcode 26
+        run: |
+          set -euo pipefail
+          # Prefer newest Xcode 26.x available on the image
+          for p in /Applications/Xcode_26.6.app /Applications/Xcode_26.5.app \
+                   /Applications/Xcode_26.4.1.app /Applications/Xcode_26.4.app \
+                   /Applications/Xcode_26.3.app /Applications/Xcode_26.2.app \
+                   /Applications/Xcode_26.1.1.app /Applications/Xcode_26.0.1.app \
+                   /Applications/Xcode_26.app /Applications/Xcode.app; do
+            if [ -d "$p" ]; then
+              sudo xcode-select -s "$p"
+              echo "Selected: $p"
+              break
+            fi
+          done
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          sw_vers
+          ls /Applications/ | grep -i xcode || true
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
-
-      - name: Show environment
-        run: |
-          xcodebuild -version
-          sw_vers
 
       - name: Fetch prebuilt host libs
         continue-on-error: true
@@ -80,19 +95,6 @@ jobs:
             echo "stub libwin32u_unix.a"
           fi
           ls -lh app/Madeira/*.a FEX/build-ios/FEXCore/Source/*.a 2>/dev/null || true
-
-      - name: Patch ContentView (no glassEffect on Xcode 16)
-        run: |
-          python3 -c '
-          from pathlib import Path
-          import re
-          p = Path("app/Madeira/ContentView.swift")
-          t = p.read_text()
-          t = re.sub(r"if #available\(iOS 26\.0, \*\) \{[\s\S]*?\} else \{\s*", "", t)
-          t = re.sub(r".*glassEffect.*\n", "", t)
-          p.write_text(t)
-          print("glassEffect left:", t.count("glassEffect"))
-          '
 
       - name: Archive (unsigned)
         run: |
