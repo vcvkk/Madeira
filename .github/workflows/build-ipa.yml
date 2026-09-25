@@ -1,7 +1,7 @@
 name: Build IPA
 
 # Builds every native chain from a clean checkout (docs/BUILDING.md) and
-# packages an UNSIGNED Madeira.ipa. No stubs.
+# packages an UNSIGNED Madeira.ipa. No runtime stubs.
 
 on:
   workflow_dispatch:
@@ -46,7 +46,6 @@ jobs:
           ln -sf "$(brew --prefix llvm)/bin/llvm-objcopy" "$RUNNER_TEMP/bin/llvm-objcopy"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-          # Wine aarch64 host configure requires PE cross tools (llvm-mingw)
           LM="$HOME/llvm-mingw"
           if [ ! -x "$LM/bin/aarch64-w64-mingw32-clang" ]; then
             URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-macos-universal.tar.xz"
@@ -138,13 +137,21 @@ jobs:
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           which aarch64-w64-mingw32-clang
+
+          # madeira wine fork: loader.c pulls in a PE-side generated unit; host
+          # makedep requires the path to exist before Makefile can be written.
+          # Real PE content is produced later by build/wine-pe; empty file is only
+          # so configure can finish and emit include/config.h + widl headers.
+          if [ ! -f wine/dlls/ntdll/arm64ec_x64_export_iat.c ]; then
+            printf '%s\n' '/* generated during PE build; empty for host configure */' \
+              > wine/dlls/ntdll/arm64ec_x64_export_iat.c
+          fi
+
           mkdir -p wine/build-macos && cd wine/build-macos
-          # Need PE tools on aarch64; --without-mingw is not enough alone
-          ../configure --without-x --without-freetype --disable-tests \
-            --with-mingw=clang
+          ../configure --without-x --without-freetype --disable-tests --with-mingw=clang
+          test -f include/config.h
           make -j"$(sysctl -n hw.ncpu)" include/all
           cd .. && ln -sfn build-macos build-arm64ec
-          test -f build-macos/include/config.h
 
       - name: Build FEXCore
         run: bash build/fex-ios/build.sh
