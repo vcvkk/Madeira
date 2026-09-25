@@ -6,10 +6,24 @@ set -eu
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 B="$R/FEX/build-ios"
 if [ ! -f "$B/CMakeCache.txt" ]; then
-    cmake -S "$R/FEX" -B "$B" -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
-        -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_FEX_LINUX_TESTS=OFF \
-        -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON
+    # iOS toolchain leaves CMAKE_SYSTEM_PROCESSOR empty; FEX CMakeLists
+    # rejects that ("Unsupported processor type"). Force arm64.
+    cmake -S "$R/FEX" -B "$B" \
+        -G Ninja \
+        -DCMAKE_SYSTEM_NAME=iOS \
+        -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+        -DCMAKE_OSX_ARCHITECTURES=arm64 \
+        -DCMAKE_OSX_SYSROOT=iphoneos \
+        -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_THUNKS=OFF \
+        -DBUILD_FEXCONFIG=OFF \
+        -DBUILD_FEX_LINUX_TESTS=OFF \
+        -DENABLE_FEX_ALLOCATOR=OFF \
+        -DENABLE_ASSERTIONS=OFF \
+        -DENABLE_CLANG_THUNKS=ON \
+        -DENABLE_CCACHE=ON
 fi
-cmake --build "$B" --target FEXCore FEXCore_Base
+cmake --build "$B" --target FEXCore FEXCore_Base -j"$(sysctl -n hw.ncpu)"
 ls "$B/FEXCore/Source/"*.a
