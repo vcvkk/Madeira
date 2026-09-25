@@ -94,7 +94,6 @@ jobs:
 
       - name: Provide x86_64-vcruntime folder
         run: |
-          # Xcode CpResource needs the directory to exist (DLLs are optional for link).
           mkdir -p app/Madeira/x86_64-vcruntime
           touch app/Madeira/x86_64-vcruntime/.gitkeep
           ls -la app/Madeira/x86_64-vcruntime
@@ -148,6 +147,65 @@ jobs:
             ar rcs app/Madeira/libwin32u_unix.a /tmp/win32u_stub.o
             echo "created stub libwin32u_unix.a — app may not run games"
           fi
+
+      - name: Patch ContentView for Xcode 16 SDK (no glassEffect)
+        run: |
+          # glassEffect is iOS 26+; Xcode 16.4 still type-checks the
+          # #available(iOS 26) branch and fails. Force material-only path.
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path("app/Madeira/ContentView.swift")
+          t = p.read_text()
+          old1 = '''    @ViewBuilder private var interior: some View {
+        if #available(iOS 26.0, *) {
+            Circle().fill(.clear).glassEffect(.regular, in: Circle())
+        } else {
+            Circle().fill(.ultraThinMaterial)
+        }
+    }'''
+          new1 = '''    @ViewBuilder private var interior: some View {
+        Circle().fill(.ultraThinMaterial)
+    }'''
+          old2 = '''struct GlassShape: View {
+    var circle = false
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            if circle { Circle().fill(.clear).glassEffect(.regular, in: Circle()) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.clear)
+                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18)) }
+        } else {
+            if circle { Circle().fill(.ultraThinMaterial) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+        }
+    }
+}'''
+          new2 = '''struct GlassShape: View {
+    var circle = false
+    var body: some View {
+        if circle { Circle().fill(.ultraThinMaterial) }
+        else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+    }
+}'''
+          if old1 not in t:
+              print("WARN: interior glassEffect block not found exactly")
+          else:
+              t = t.replace(old1, new1)
+              print("patched interior")
+          if old2 not in t:
+              print("WARN: GlassShape glassEffect block not found exactly")
+          else:
+              t = t.replace(old2, new2)
+              print("patched GlassShape")
+          # Fallback: strip any remaining glassEffect lines
+          if "glassEffect" in t:
+              import re
+              t2 = re.sub(r'.*glassEffect.*\n', '', t)
+              if t2 != t:
+                  print("stripped residual glassEffect lines")
+                  t = t2
+          p.write_text(t)
+          print("glassEffect remaining:", t.count("glassEffect"))
+          PY
 
       - name: Inventory libs before xcodebuild
         run: |
@@ -231,7 +289,7 @@ jobs:
             echo ""
             echo "- Configuration: \`${{ github.event.inputs.configuration || 'Debug' }}\`"
             echo "- Artifact: \`${{ env.IPA_NAME || 'n/a' }}\`"
-            echo "- Host libs from GameHub + stubs for missing pieces"
+            echo "- glassEffect stripped for Xcode 16 SDK"
             echo "- Unsigned — re-sign before install"
             echo ""
             ls -lh "${{ env.IPA_NAME }}" 2>/dev/null || echo "(no IPA)"
