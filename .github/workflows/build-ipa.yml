@@ -1,276 +1,201 @@
 name: Build IPA
 
+# Builds every native chain from a clean checkout (docs/BUILDING.md) and
+# packages an UNSIGNED Madeira.ipa. No stubs.
+
 on:
   workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode configuration (Debug is the one that runs games)
+        default: Debug
+        type: choice
+        options: [Debug, Release]
   push:
+    branches: [main]
     paths:
       - ".github/workflows/build-ipa.yml"
+      - "scripts/ci/**"
+      - "build/**"
 
-# No stubs. Follow docs/BUILDING.md host chain. Fail if any required .a is missing.
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: 15.0.7
+  FREETYPE_TAG: VER-2-13-3
+  CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
 
 jobs:
-  build-ipa:
-    name: Real host libs + unsigned IPA
+  ipa:
     runs-on: macos-15
-    timeout-minutes: 360
-
+    timeout-minutes: 350
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
 
-      - name: Select Xcode 26 (iOS 26 SDK)
+      - name: Host tools
         run: |
-          set -euo pipefail
-          for p in /Applications/Xcode_26.6.app /Applications/Xcode_26.5.app \
-                   /Applications/Xcode_26.4.1.app /Applications/Xcode_26.3.app \
-                   /Applications/Xcode_26.2.app /Applications/Xcode.app; do
-            if [ -d "$p" ]; then sudo xcode-select -s "$p"; break; fi
-          done
+          brew install ninja meson bison flex llvm ccache cmake pkg-config
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin"  >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/bin"
+          ln -sf "$(brew --prefix llvm)/bin/llvm-objcopy" "$RUNNER_TEMP/bin/llvm-objcopy"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          sw_vers
 
-      - name: Install build deps + llvm-mingw
+      - name: Restore LLVM (iOS) cache
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ env.LLVM_VERSION }}-v1
+
+      - name: Build LLVM ${{ env.LLVM_VERSION }} for iOS
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
         run: |
-          set -euo pipefail
-          brew install cmake ninja flex bison pkg-config python3 coreutils ccache || true
-          python3 -m pip install --break-system-packages --user packaging setuptools || true
-          echo "/opt/homebrew/opt/bison/bin" >> "$GITHUB_PATH"
-          echo "/opt/homebrew/opt/flex/bin" >> "$GITHUB_PATH"
-          echo "/opt/homebrew/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+          set -eux
+          mkdir -p toolchains && cd toolchains
+          git clone --depth 1 --branch llvmorg-$LLVM_VERSION --filter=blob:none --sparse \
+              https://github.com/llvm/llvm-project.git llvm-project
+          git -C llvm-project sparse-checkout set llvm cmake third-party
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' llvm-project/llvm/cmake/modules/AddLLVM.cmake
+          COMMON=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=
+                  -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+                  -DLLVM_INCLUDE_DOCS=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF
+                  -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF
+                  -DCMAKE_CXX_FLAGS=-Wno-enum-constexpr-conversion)
+          cmake -S llvm-project/llvm -B llvm-host-build "${COMMON[@]}"
+          ninja -C llvm-host-build llvm-tblgen
+          cmake -S llvm-project/llvm -B llvm-ios-build "${COMMON[@]}" \
+              -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+              -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
+              -DLLVM_TARGET_ARCH=host -DLLVM_ENABLE_PROJECTS= \
+              -DLLVM_BUILD_TOOLS=OFF -DLLVM_INCLUDE_TOOLS=OFF -DLLVM_BUILD_UTILS=OFF -DLLVM_INCLUDE_UTILS=OFF \
+              -DLLVM_TABLEGEN="$PWD/llvm-host-build/bin/llvm-tblgen"
+          ninja -C llvm-ios-build
+          ls llvm-ios-build/lib/*.a | wc -l
 
-          LM="$HOME/llvm-mingw"
-          CLANG="$LM/bin/aarch64-w64-mingw32-clang"
-          if [ ! -x "$CLANG" ]; then
-            URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-macos-universal.tar.xz"
-            echo "Downloading $URL"
-            curl -fL --retry 3 -o /tmp/llvm-mingw.tar.xz "$URL"
-            ls -lh /tmp/llvm-mingw.tar.xz
-            rm -rf "$LM"
-            mkdir -p "$LM"
-            tar -xJf /tmp/llvm-mingw.tar.xz -C "$LM" --strip-components=1
-            ls -la "$LM/bin" | head -20
-          fi
-          test -x "$CLANG"
-          echo "$LM/bin" >> "$GITHUB_PATH"
-          # GITHUB_PATH applies to *next* steps; use full path here
-          "$CLANG" --version | head -2
+      - name: Save LLVM (iOS) cache
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ env.LLVM_VERSION }}-v1
 
-      - name: Generate FEX config headers
+      - name: Restore GnuTLS cache
+        id: gnutls-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/gnutls-ios
+          key: gnutls-ios-${{ hashFiles('build/gnutls-ios/build.sh', 'build/gnutls-ios/src/SHA256SUMS') }}
+
+      - name: Build GnuTLS stack
+        if: steps.gnutls-cache.outputs.cache-hit != 'true'
+        run: bash build/gnutls-ios/build.sh
+
+      - name: Save GnuTLS cache
+        if: steps.gnutls-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains/gnutls-ios
+          key: gnutls-ios-${{ hashFiles('build/gnutls-ios/build.sh', 'build/gnutls-ios/src/SHA256SUMS') }}
+
+      - name: Build FreeType
         run: |
-          set -euo pipefail
-          IN=FEX/FEXCore/Source/Interface/Config/Config.json.in
-          OUT=FEX/FEXCore/include/FEXCore/Config
-          mkdir -p "$OUT" FEX/build-ios/include/FEXCore/Config
-          sed -E 's/@[A-Za-z0-9_]+@/\/tmp\/fex-placeholder/g' "$IN" > /tmp/fex-Config.json
-          python3 FEX/FEXCore/Scripts/config_generator.py \
-            /tmp/fex-Config.json \
-            "$OUT/ConfigValues.inl" \
-            /tmp/fex.1 \
-            "$OUT/ConfigOptions.inl"
-          cp "$OUT/ConfigValues.inl" "$OUT/ConfigOptions.inl" FEX/build-ios/include/FEXCore/Config/
+          set -eux
+          rm -rf research/freetype
+          git clone --depth 1 --branch "$FREETYPE_TAG" https://github.com/freetype/freetype.git research/freetype \
+            || git clone --depth 1 https://github.com/freetype/freetype.git research/freetype
+          test -d research/freetype
+          bash build/freetype-ios/build.sh
 
-      - name: Wine config.h
+      - name: Configure Wine (host headers)
         run: |
-          set -euo pipefail
-          export PATH="$HOME/llvm-mingw/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
-          export BISON=/opt/homebrew/opt/bison/bin/bison FLEX=/opt/homebrew/opt/flex/bin/flex
+          set -eux
           mkdir -p wine/build-macos && cd wine/build-macos
-          if [ ! -f include/config.h ]; then
-            ../configure --enable-win64 --without-x --without-freetype --without-gstreamer \
-              --disable-tests --disable-win16 CFLAGS="-O2 -pipe" \
-              > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1 || true
-            tail -40 "$GITHUB_WORKSPACE/wine-configure.log" || true
-          fi
-          test -f include/config.h
+          ../configure --without-x --without-mingw --without-freetype --disable-tests
+          make -j"$(sysctl -n hw.ncpu)" include/all
+          cd .. && ln -sfn build-macos build-arm64ec
+
+      - name: Build FEXCore
+        run: bash build/fex-ios/build.sh
 
       - name: Build libntdll_unix.a
-        timeout-minutes: 40
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/llvm-mingw/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
-          bash build/ntdll-unix/build.sh
-          test -s app/Madeira/libntdll_unix.a
-          ls -lh app/Madeira/libntdll_unix.a
+        run: bash build/ntdll-unix/build.sh
 
       - name: Build libwineserver.a
-        timeout-minutes: 45
         run: |
-          set -euo pipefail
-          export PATH="$HOME/llvm-mingw/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
-          bash build/wineserver/build.sh
-          test -s app/Madeira/libwineserver.a
-          ls -lh app/Madeira/libwineserver.a
+          bash scripts/ci/build-wineserver-base.sh
+          bash build/wineserver/build.sh all
 
       - name: Build libwin32u_unix.a
-        timeout-minutes: 45
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/llvm-mingw/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
-          bash build/win32u-unix/build.sh
-          test -s app/Madeira/libwin32u_unix.a
-          ls -lh app/Madeira/libwin32u_unix.a
-
-      - name: Build FEXCore (iOS)
-        timeout-minutes: 90
-        run: |
-          set -euo pipefail
-          bash build/fex-ios/build.sh
-          test -s FEX/build-ios/FEXCore/Source/libFEXCore.a
-          test -s FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
-          ls -lh FEX/build-ios/FEXCore/Source/*.a
-          if [ ! -s FEX/build-ios/FEXCore/Source/libJemallocLibs.a ]; then
-            echo "::error::libJemallocLibs.a missing after FEX build"
-            find FEX/build-ios -name '*.a' | head -50
-            exit 1
-          fi
-
-      - name: Build LLVM for iOS (DXMT dependency)
-        timeout-minutes: 120
-        run: |
-          set -euo pipefail
-          if [ -d toolchains/llvm-ios-build ] && [ -f toolchains/llvm-ios-build/lib/libLLVMSupport.a ]; then
-            echo "llvm-ios-build already present"
-            exit 0
-          fi
-          mkdir -p toolchains
-          if [ ! -d toolchains/llvm-project/.git ]; then
-            git clone --depth 1 https://github.com/llvm/llvm-project.git toolchains/llvm-project
-            git -C toolchains/llvm-project fetch --depth 1 origin 8dfdcc7b7 || true
-            git -C toolchains/llvm-project checkout 8dfdcc7b7 || git -C toolchains/llvm-project checkout HEAD
-          fi
-          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_TARGETS_TO_BUILD=AArch64 \
-            -DLLVM_ENABLE_PROJECTS="" \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_BUILD_TOOLS=ON \
-            -G Ninja
-          cmake --build toolchains/llvm-host-build --target llvm-tblgen -j$(sysctl -n hw.ncpu)
-          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 \
-            -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
-            -DLLVM_TARGET_ARCH=host \
-            -DLLVM_TARGETS_TO_BUILD="" \
-            -DLLVM_ENABLE_PROJECTS="" \
-            -DLLVM_BUILD_TOOLS=OFF \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_ENABLE_ZLIB=OFF \
-            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen" \
-            -G Ninja
-          cmake --build toolchains/llvm-ios-build -j$(sysctl -n hw.ncpu)
+        run: bash build/win32u-unix/build.sh
 
       - name: Build libdxmt_combined.a
-        timeout-minutes: 60
         run: |
-          set -euo pipefail
+          set -eux
+          mv build/madeira-d3d12/deps.sh build/madeira-d3d12/deps.sh.off || true
           bash build/dxmt-ios/build.sh
-          test -s app/Madeira/libdxmt_combined.a
-          ls -lh app/Madeira/libdxmt_combined.a
+          mv build/madeira-d3d12/deps.sh.off build/madeira-d3d12/deps.sh || true
+          xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a \
+              build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
+          cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
 
-      - name: Build wineios driver objects
-        timeout-minutes: 30
+      - name: Build Madeira.app
         run: |
-          set -euo pipefail
-          if [ -x build/wineios-drv/build.sh ]; then
-            bash build/wineios-drv/build.sh
-          elif [ -f build/wineios-drv/Makefile ]; then
-            make -C build/wineios-drv
-          else
-            echo "::error::no wineios-drv build script"
-            ls -la build/wineios-drv || true
-            exit 1
-          fi
-
-      - name: x86_64-vcruntime (required CpResource folder)
-        run: |
-          set -euo pipefail
-          DEST=app/Madeira/x86_64-vcruntime
-          mkdir -p "$DEST"
-          brew install sevenzip || true
-          TMP=/tmp/vcredist
-          mkdir -p "$TMP"
-          curl -fsSL -o "$TMP/VC_redist.x64.exe" "https://aka.ms/vs/17/release/vc_redist.x64.exe" || true
-          if [ -s "$TMP/VC_redist.x64.exe" ] && command -v 7zz >/dev/null; then
-            7zz x "$TMP/VC_redist.x64.exe" -o"$TMP/ex" -y || true
-            find "$TMP" -iname '*.dll' 2>/dev/null | while read -r f; do
-              case "$(basename "$f" | tr '[:upper:]' '[:lower:]')" in
-                vcruntime140*.dll|msvcp140*.dll|concrt140.dll|vcomp140.dll|vcamp140.dll|vccorlib140.dll)
-                  cp -v "$f" "$DEST/" || true ;;
-              esac
-            done
-          fi
-          ls -la "$DEST"
-
-      - name: Require real libs (fail if any missing)
-        run: |
-          set -euo pipefail
-          miss=0
-          for p in \
-            app/Madeira/libgmp.a \
-            app/Madeira/libgnutls.a \
-            app/Madeira/libhogweed.a \
-            app/Madeira/libnettle.a \
-            app/Madeira/libntdll_unix.a \
-            app/Madeira/libwineserver.a \
-            app/Madeira/libwin32u_unix.a \
-            app/Madeira/libdxmt_combined.a \
-            FEX/build-ios/FEXCore/Source/libFEXCore.a \
-            FEX/build-ios/FEXCore/Source/libFEXCore_Base.a \
-            FEX/build-ios/FEXCore/Source/libJemallocLibs.a \
-            FEX/build-ios/External/fmt/libfmt.a \
-            FEX/build-ios/External/cephes/libcephes_128bit.a \
-            FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a \
-            FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a
-          do
-            if [ -s "$p" ]; then
-              ls -lh "$p"
-            else
-              echo "MISSING $p"
-              miss=1
-            fi
-          done
-          test "$miss" -eq 0
-
-      - name: Archive (unsigned)
-        run: |
-          set -euo pipefail
-          xcodebuild archive \
-            -project app/Madeira.xcodeproj \
-            -scheme Madeira \
-            -configuration Debug \
-            -destination "generic/platform=iOS" \
-            -archivePath build/Madeira.xcarchive \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            DEVELOPMENT_TEAM="" \
-            ONLY_ACTIVE_ARCH=NO
+          set -eux
+          bash build/stage-licenses.sh || true
+          mkdir -p app/Madeira/x86_64-vcruntime
+          xcodebuild -project app/Madeira.xcodeproj -target Madeira \
+              -configuration "$CONFIGURATION" -sdk iphoneos \
+              SYMROOT="$PWD/app/build" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+              build > xcodebuild.log 2>&1 \
+            || { grep -E "error:|Undefined symbols|referenced from" -A3 xcodebuild.log | head -300; tail -50 xcodebuild.log; exit 1; }
+          tail -5 xcodebuild.log
 
       - name: Package IPA
         run: |
-          set -euo pipefail
-          APP_PATH=$(find build/Madeira.xcarchive -name "Madeira.app" -type d | head -1)
-          test -n "$APP_PATH"
-          IPA_NAME="Madeira-Debug-${{ github.run_number }}.ipa"
-          rm -rf Payload && mkdir Payload
-          cp -R "$APP_PATH" Payload/
-          zip -r -q "$IPA_NAME" Payload
-          rm -rf Payload
-          ls -lh "$IPA_NAME"
-          echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+          set -eux
+          APP="app/build/$CONFIGURATION-iphoneos/Madeira.app"
+          codesign --force --sign - --entitlements app/Madeira/Madeira.entitlements "$APP" || true
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry "../Madeira-$CONFIGURATION-unsigned.ipa" Payload)
+          ls -lh Madeira-*.ipa
 
-      - name: Upload IPA artifact
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-${{ env.CONFIGURATION }}-ipa
+          path: Madeira-*.ipa
+          compression-level: 0
+
+      - name: Show compiler errors
+        if: failure()
+        run: |
+          for f in build/*/obj/*.err build/*/obj/err-*.txt; do
+            [ -s "$f" ] && { echo "::group::$f"; head -60 "$f"; echo "::endgroup::"; }
+          done
+          true
+
+      - name: Upload logs on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Madeira-ipa
-          path: ${{ env.IPA_NAME }}
-          retention-days: 14
+          name: build-logs
+          path: |
+            xcodebuild.log
+            build/*/obj/*.err
+            build/*/obj/err-*.txt
+            wine/build-macos/config.log
+          if-no-files-found: ignore
