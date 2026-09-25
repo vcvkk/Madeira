@@ -206,7 +206,7 @@ jobs:
           # server_ios.c's [xp] line reads rusage_info_v6.ri_page_wait_time_mach,
           # which only newer SDKs than this runner's declare. If the SDK lacks
           # it, log 0 for that one diagnostic column instead.
-          printf '#include <libproc.h>\nint f(struct rusage_info_v6 *r){return (int)r->ri_page_wait_time_mach;}\n' > "$RUNNER_TEMP/ru.c"
+          printf '#include <sys/resource.h>\nint f(struct rusage_info_v6 *r){return (int)r->ri_page_wait_time_mach;}\n' > "$RUNNER_TEMP/ru.c"
           if ! xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -c "$RUNNER_TEMP/ru.c" -o /dev/null 2>/dev/null; then
             echo "::warning::SDK lacks ri_page_wait_time_mach; [xp] pgw column logs 0"
             sed -i '' 's/XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach )/0.0/' build/ntdll-unix/server_ios.c
