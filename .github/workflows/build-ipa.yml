@@ -1,0 +1,215 @@
+name: Build IPA
+
+# Builds every native chain from a clean checkout (docs/BUILDING.md) and
+# packages an UNSIGNED Madeira.ipa for sideloading (Sideloadly, AltStore, ...
+# re-sign it with your own Apple ID).
+#
+# Not built here, because the inputs are not redistributable:
+#   - app/Madeira/x86_64-vcruntime (Microsoft VC++ runtime) — shipped empty;
+#     see tools/fetch-vcruntime.md.
+#   - the madeira-d3d12 converter canary (needs Apple's Metal Shader Converter
+#     package); the D3D11 path via DXMT is unaffected.
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode configuration (Debug is the one that runs games)
+        default: Debug
+        type: choice
+        options: [Debug, Release]
+  push:
+    branches: [claude/ipa-build-actions-lkajka]
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: 15.0.7
+  FREETYPE_TAG: VER-2-13-3
+  CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Host tools
+        run: |
+          brew install ninja meson bison flex llvm ccache
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin"  >> "$GITHUB_PATH"
+          # llvm-objcopy only (build/wineserver/build.sh); keep Apple clang first.
+          mkdir -p "$RUNNER_TEMP/bin"
+          ln -sf "$(brew --prefix llvm)/bin/llvm-objcopy" "$RUNNER_TEMP/bin/llvm-objcopy"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+
+      # ---------------------------------------------------------------- LLVM
+      - name: Restore LLVM (iOS) cache
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ env.LLVM_VERSION }}-v1
+
+      - name: Build LLVM ${{ env.LLVM_VERSION }} for iOS
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          mkdir -p toolchains && cd toolchains
+          git clone --depth 1 --branch llvmorg-$LLVM_VERSION --filter=blob:none --sparse \
+              https://github.com/llvm/llvm-project.git llvm-project
+          git -C llvm-project sparse-checkout set llvm cmake third-party
+          # Apple ld wants -dead_strip, not --gc-sections (build/dxmt-ios/README.md).
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' llvm-project/llvm/cmake/modules/AddLLVM.cmake
+          COMMON=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=
+                  -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+                  -DLLVM_INCLUDE_DOCS=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF
+                  -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF
+                  -DCMAKE_CXX_FLAGS=-Wno-enum-constexpr-conversion)
+          cmake -S llvm-project/llvm -B llvm-host-build "${COMMON[@]}"
+          ninja -C llvm-host-build llvm-tblgen
+          cmake -S llvm-project/llvm -B llvm-ios-build "${COMMON[@]}" \
+              -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+              -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
+              -DLLVM_TARGET_ARCH=host -DLLVM_ENABLE_PROJECTS= \
+              -DLLVM_BUILD_TOOLS=OFF -DLLVM_INCLUDE_TOOLS=OFF -DLLVM_BUILD_UTILS=OFF -DLLVM_INCLUDE_UTILS=OFF \
+              -DLLVM_TABLEGEN="$PWD/llvm-host-build/bin/llvm-tblgen"
+          ninja -C llvm-ios-build
+          ls llvm-ios-build/lib/*.a | wc -l
+
+      - name: Save LLVM (iOS) cache
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ env.LLVM_VERSION }}-v1
+
+      # -------------------------------------------------------------- GnuTLS
+      - name: Restore GnuTLS cache
+        id: gnutls-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/gnutls-ios
+          key: gnutls-ios-${{ hashFiles('build/gnutls-ios/build.sh', 'build/gnutls-ios/src/SHA256SUMS') }}
+
+      - name: Build GnuTLS stack
+        if: steps.gnutls-cache.outputs.cache-hit != 'true'
+        run: build/gnutls-ios/build.sh
+
+      - name: Save GnuTLS cache
+        if: steps.gnutls-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains/gnutls-ios
+          key: gnutls-ios-${{ hashFiles('build/gnutls-ios/build.sh', 'build/gnutls-ios/src/SHA256SUMS') }}
+
+      # ------------------------------------------------------------ FreeType
+      - name: Build FreeType
+        run: |
+          git clone --depth 1 --branch "$FREETYPE_TAG" https://github.com/freetype/freetype.git research/freetype
+          build/freetype-ios/build.sh
+
+      # ------------------------------------------------- Wine host headers
+      # build-macos provides config.h + widl-generated headers for the unix
+      # side. The PE-side headers the scripts read from build-arm64ec/include
+      # are the same widl output, so that path points at this tree.
+      - name: Configure Wine (host headers)
+        run: |
+          set -eux
+          mkdir -p wine/build-macos && cd wine/build-macos
+          ../configure --without-x --without-mingw --without-freetype --disable-tests
+          make -j"$(sysctl -n hw.ncpu)" include/all
+          cd .. && ln -sfn build-macos build-arm64ec
+
+      # ----------------------------------------------------------------- FEX
+      - name: Build FEXCore
+        run: build/fex-ios/build.sh
+
+      # -------------------------------------------------- Wine unix side
+      - name: Build libntdll_unix.a
+        run: build/ntdll-unix/build.sh
+
+      - name: Build libwineserver.a
+        run: |
+          scripts/ci/build-wineserver-base.sh
+          build/wineserver/build.sh all
+
+      - name: Build libwin32u_unix.a
+        run: build/win32u-unix/build.sh
+
+      # ---------------------------------------------------------------- DXMT
+      - name: Build libdxmt_combined.a
+        run: |
+          set -eux
+          # deps.sh exits the sourcing shell when the converter package is
+          # absent, which would abort build.sh; the canary is optional.
+          mv build/madeira-d3d12/deps.sh build/madeira-d3d12/deps.sh.off
+          build/dxmt-ios/build.sh
+          mv build/madeira-d3d12/deps.sh.off build/madeira-d3d12/deps.sh
+          xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a \
+              build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
+          cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
+
+      # ----------------------------------------------------------------- App
+      - name: Build Madeira.app
+        run: |
+          set -eux
+          build/stage-licenses.sh
+          mkdir -p app/Madeira/x86_64-vcruntime
+          xcodebuild -project app/Madeira.xcodeproj -target Madeira \
+              -configuration "$CONFIGURATION" -sdk iphoneos \
+              SYMROOT="$PWD/app/build" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+              build > xcodebuild.log 2>&1 \
+            || { grep -E "error:|Undefined symbols|referenced from" -A3 xcodebuild.log | head -300; tail -50 xcodebuild.log; exit 1; }
+          tail -5 xcodebuild.log
+
+      - name: Package IPA
+        run: |
+          set -eux
+          APP="app/build/$CONFIGURATION-iphoneos/Madeira.app"
+          codesign --force --sign - --entitlements app/Madeira/Madeira.entitlements "$APP" || true
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry "../Madeira-$CONFIGURATION-unsigned.ipa" Payload)
+          ls -lh Madeira-*.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-${{ env.CONFIGURATION }}-ipa
+          path: Madeira-*.ipa
+          compression-level: 0
+
+      - name: Show compiler errors
+        if: failure()
+        run: |
+          for f in build/*/obj/*.err build/*/obj/err-*.txt; do
+            [ -s "$f" ] && { echo "::group::$f"; head -60 "$f"; echo "::endgroup::"; }
+          done
+          true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            xcodebuild.log
+            build/*/obj/*.err
+            build/*/obj/err-*.txt
+            wine/build-macos/config.log
+          if-no-files-found: ignore
