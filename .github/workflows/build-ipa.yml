@@ -38,12 +38,26 @@ jobs:
 
       - name: Host tools
         run: |
+          set -eux
           brew install ninja meson bison flex llvm ccache cmake pkg-config
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin"  >> "$GITHUB_PATH"
           mkdir -p "$RUNNER_TEMP/bin"
           ln -sf "$(brew --prefix llvm)/bin/llvm-objcopy" "$RUNNER_TEMP/bin/llvm-objcopy"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+          # Wine aarch64 host configure requires PE cross tools (llvm-mingw)
+          LM="$HOME/llvm-mingw"
+          if [ ! -x "$LM/bin/aarch64-w64-mingw32-clang" ]; then
+            URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-macos-universal.tar.xz"
+            curl -fL --retry 3 -o /tmp/llvm-mingw.tar.xz "$URL"
+            rm -rf "$LM" && mkdir -p "$LM"
+            tar -xJf /tmp/llvm-mingw.tar.xz -C "$LM" --strip-components=1
+          fi
+          test -x "$LM/bin/aarch64-w64-mingw32-clang"
+          echo "$LM/bin" >> "$GITHUB_PATH"
+          export PATH="$LM/bin:$PATH"
+          aarch64-w64-mingw32-clang --version | head -1
           xcodebuild -version
 
       - name: Restore LLVM (iOS) cache
@@ -122,24 +136,37 @@ jobs:
       - name: Configure Wine (host headers)
         run: |
           set -eux
+          export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          which aarch64-w64-mingw32-clang
           mkdir -p wine/build-macos && cd wine/build-macos
-          ../configure --without-x --without-mingw --without-freetype --disable-tests
+          # Need PE tools on aarch64; --without-mingw is not enough alone
+          ../configure --without-x --without-freetype --disable-tests \
+            --with-mingw=clang
           make -j"$(sysctl -n hw.ncpu)" include/all
           cd .. && ln -sfn build-macos build-arm64ec
+          test -f build-macos/include/config.h
 
       - name: Build FEXCore
         run: bash build/fex-ios/build.sh
 
       - name: Build libntdll_unix.a
-        run: bash build/ntdll-unix/build.sh
+        run: |
+          set -eux
+          export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          bash build/ntdll-unix/build.sh
 
       - name: Build libwineserver.a
         run: |
+          set -eux
+          export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           bash scripts/ci/build-wineserver-base.sh
           bash build/wineserver/build.sh all
 
       - name: Build libwin32u_unix.a
-        run: bash build/win32u-unix/build.sh
+        run: |
+          set -eux
+          export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          bash build/win32u-unix/build.sh
 
       - name: Build libdxmt_combined.a
         run: |
