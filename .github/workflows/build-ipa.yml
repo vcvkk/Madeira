@@ -18,13 +18,35 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           sw_vers
-          ls /Applications/ | grep -i xcode || true
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
+
+      - name: Generate FEX config headers
+        run: |
+          set -euo pipefail
+          # ConfigValues.inl + ConfigOptions.inl are cmake-generated; produce them here.
+          IN=FEX/FEXCore/Source/Interface/Config/Config.json.in
+          JSON=/tmp/fex-Config.json
+          OUT_DIR=FEX/FEXCore/include/FEXCore/Config
+          mkdir -p "$OUT_DIR" FEX/build-ios/include/FEXCore/Config
+
+          # Strip cmake @VAR@ placeholders to usable JSON defaults
+          sed -E 's/@[A-Za-z0-9_]+@/\/tmp\/fex-placeholder/g' "$IN" > "$JSON"
+          python3 FEX/FEXCore/Scripts/config_generator.py \
+            "$JSON" \
+            "$OUT_DIR/ConfigValues.inl" \
+            /tmp/fex.1 \
+            "$OUT_DIR/ConfigOptions.inl"
+
+          # Also mirror under build-ios include path (some targets use that)
+          cp -v "$OUT_DIR/ConfigValues.inl" "$OUT_DIR/ConfigOptions.inl" \
+            FEX/build-ios/include/FEXCore/Config/ 2>/dev/null || true
+          ls -la "$OUT_DIR"
+          head -5 "$OUT_DIR/ConfigValues.inl"
 
       - name: Fetch prebuilt host libs
         continue-on-error: true
@@ -81,7 +103,6 @@ jobs:
             ar rcs app/Madeira/libwin32u_unix.a /tmp/win32u_stub.o
             echo "stub libwin32u_unix.a"
           fi
-          ls -lh app/Madeira/*.a FEX/build-ios/FEXCore/Source/*.a 2>/dev/null || true
 
       - name: Archive (unsigned)
         run: |
