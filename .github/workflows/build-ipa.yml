@@ -38,7 +38,7 @@ jobs:
       - name: Install build deps
         run: |
           set -euo pipefail
-          brew install cmake ninja flex bison pkg-config python3 coreutils sevenzip || true
+          brew install cmake ninja flex bison pkg-config python3 coreutils || true
           python3 -m pip install --break-system-packages --user packaging setuptools || true
           echo "/opt/homebrew/opt/bison/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/opt/flex/bin" >> "$GITHUB_PATH"
@@ -92,46 +92,12 @@ jobs:
           echo "=== Prebuilt placement ==="
           find app/Madeira FEX/build-ios -name '*.a' -exec ls -lh {} \; 2>/dev/null || true
 
-      - name: Provide x86_64-vcruntime (VC++ redistributable)
+      - name: Provide x86_64-vcruntime folder
         run: |
-          set -euo pipefail
-          DEST=app/Madeira/x86_64-vcruntime
-          mkdir -p "$DEST"
-          # Always ensure the folder exists (Xcode CpResource fails if missing).
-          # Try to extract official MSVC x64 redist DLLs for completeness.
-          if [ -z "$(ls -A "$DEST" 2>/dev/null)" ]; then
-            brew install sevenzip 2>/dev/null || true
-            TMP=/tmp/vcredist
-            mkdir -p "$TMP"
-            # Microsoft Visual C++ 2015-2022 Redistributable (x64)
-            curl -fsSL -o "$TMP/VC_redist.x64.exe" \
-              "https://aka.ms/vs/17/release/vc_redist.x64.exe" || true
-            if [ -s "$TMP/VC_redist.x64.exe" ]; then
-              7zz x "$TMP/VC_redist.x64.exe" -o"$TMP/ex" -y || true
-              # CABINET layout varies; search for known DLLs
-              find "$TMP" -iname 'vcruntime140*.dll' -o -iname 'msvcp140*.dll' -o -iname 'concrt140.dll' -o -iname 'vcomp140.dll' -o -iname 'vcamp140.dll' -o -iname 'vccorlib140.dll' 2>/dev/null | while read -r f; do
-                cp -v "$f" "$DEST/" || true
-              done
-              # Also expand nested CABs if present
-              find "$TMP/ex" -iname '*.cab' 2>/dev/null | while read -r cab; do
-                7zz x "$cab" -o"$TMP/cab" -y >/dev/null 2>&1 || true
-              done
-              find "$TMP/cab" -iname '*.dll' 2>/dev/null | while read -r f; do
-                base=$(basename "$f" | tr '[:upper:]' '[:lower:]')
-                case "$base" in
-                  concrt140.dll|msvcp140*.dll|vcruntime140*.dll|vcamp140.dll|vccorlib140.dll|vcomp140.dll)
-                    cp -v "$f" "$DEST/" || true
-                    ;;
-                esac
-              done
-            fi
-          fi
-          # Placeholder so the resource folder is never empty if extract failed
-          if [ -z "$(ls -A "$DEST" 2>/dev/null)" ]; then
-            echo "VC redist extract empty — leaving placeholder .gitkeep"
-            touch "$DEST/.gitkeep"
-          fi
-          ls -la "$DEST"
+          # Xcode CpResource needs the directory to exist (DLLs are optional for link).
+          mkdir -p app/Madeira/x86_64-vcruntime
+          touch app/Madeira/x86_64-vcruntime/.gitkeep
+          ls -la app/Madeira/x86_64-vcruntime
 
       - name: Build libwin32u_unix.a (if missing)
         continue-on-error: true
@@ -178,7 +144,6 @@ jobs:
             find "$OBJ" -name '*.o' -print0 | xargs -0 ar rcs app/Madeira/libwin32u_unix.a
             ls -lh app/Madeira/libwin32u_unix.a
           else
-            # Last resort: empty stub so link gets past -lwin32u_unix path existence
             echo 'void madeira_win32u_stub(void){}' | xcrun -sdk iphoneos clang -arch arm64 -c -x c - -o /tmp/win32u_stub.o
             ar rcs app/Madeira/libwin32u_unix.a /tmp/win32u_stub.o
             echo "created stub libwin32u_unix.a — app may not run games"
@@ -266,9 +231,8 @@ jobs:
             echo ""
             echo "- Configuration: \`${{ github.event.inputs.configuration || 'Debug' }}\`"
             echo "- Artifact: \`${{ env.IPA_NAME || 'n/a' }}\`"
-            echo "- Host libs: GameHub artifacts + win32u/jemalloc stubs if needed"
-            echo "- x86_64-vcruntime: extracted from VC_redist.x64.exe when possible"
-            echo "- Unsigned — re-sign (Feather / AltStore) before install"
+            echo "- Host libs from GameHub + stubs for missing pieces"
+            echo "- Unsigned — re-sign before install"
             echo ""
             ls -lh "${{ env.IPA_NAME }}" 2>/dev/null || echo "(no IPA)"
           } >> "$GITHUB_STEP_SUMMARY"
