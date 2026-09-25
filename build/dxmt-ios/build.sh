@@ -87,7 +87,10 @@ compile_objcxx_arc() {
         echo "FAILED"; FAILED=$((FAILED+1)); FAILED_FILES="$FAILED_FILES $name"
     fi
 }
+# deps.sh exits (not returns) when the package is missing, which would end
+# this script if sourced directly, so probe it in a subshell first.
 if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
+   ( source "$BUILD_DIR/../madeira-d3d12/deps.sh" ) >/dev/null 2>&1 && \
    source "$BUILD_DIR/../madeira-d3d12/deps.sh" 2>/dev/null; then
     echo "=== madeira-d3d12 canary (Objective-C++, Metal Shader Converter) ==="
     compile_objcxx_arc "$REPO_ROOT/research/madeira-d3d12/tests/native/msc_canary.mm" \
@@ -111,6 +114,15 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ags.cpp" madeira_ags
 else
     echo "=== madeira-d3d12 canary SKIPPED (converter package not resolvable) ==="
+    # The app and winemetal still call these entry points; link stand-ins that
+    # report the converter as absent.
+    printf "  %-40s " madeira_d3d12_absent
+    if xcrun -sdk iphoneos clang $COMMON_FLAGS -I"$REPO_ROOT/research/madeira-d3d12/src" \
+        -c "$BUILD_DIR/madeira_d3d12_absent.c" -o "$OBJ_DIR/madeira_d3d12_absent.o" 2>"$OBJ_DIR/madeira_d3d12_absent.err"; then
+        echo "OK"; SUCCEEDED=$((SUCCEEDED+1))
+    else
+        echo "FAILED"; FAILED=$((FAILED+1)); FAILED_FILES="$FAILED_FILES madeira_d3d12_absent"
+    fi
 fi
 
 echo "=== winemetal unix (Objective-C) ==="

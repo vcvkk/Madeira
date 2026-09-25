@@ -15,14 +15,15 @@ MARK = "/* CI: patch-fex-ios */"
 def patch(rel, edit):
     path = ROOT / rel
     text = path.read_text()
-    if MARK in text:
-        print(f"already patched: {rel}")
+    tag = f"patch-fex-ios:{edit.__name__}"
+    if tag in text:
+        print(f"already patched: {rel} ({edit.__name__})")
         return
     new = edit(text)
     if new == text:
         sys.exit(f"patch-fex-ios: anchor not found in {rel}")
-    path.write_text(new)
-    print(f"patched: {rel}")
+    path.write_text(new.replace(MARK, f"/* CI: {tag} */", 1))
+    print(f"patched: {rel} ({edit.__name__})")
 
 
 def insert_before(text, anchor, block):
@@ -34,8 +35,11 @@ def insert_before(text, anchor, block):
 # On Apple, FEX's CMake forces ENABLE_FEX_ALLOCATOR off, but the fallback
 # malloc_usable_size still calls IOS_RPM_GUARD(), which is only defined in the
 # allocator branch.
-patch("FEXCore/Source/Utils/AllocatorHooks.cpp",
-      lambda t: f"#ifndef ENABLE_FEX_ALLOCATOR {MARK}\n#define IOS_RPM_GUARD() ((void)0)\n#endif\n" + t)
+def rpm_guard(t):
+    return f"#ifndef ENABLE_FEX_ALLOCATOR {MARK}\n#define IOS_RPM_GUARD() ((void)0)\n#endif\n" + t
+
+
+patch("FEXCore/Source/Utils/AllocatorHooks.cpp", rpm_guard)
 
 
 # The [ffs-bypass] / [cb-entry] reporters in CompileBlock read IosFfsBypassLog
@@ -45,7 +49,7 @@ def core(t):
                       f"#ifdef FEX_IOS_HOST {MARK}\n")
     t2 = insert_before(t, "  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs.",
                        "#endif\n\n")
-    return t2 if t2 != t and MARK in t else t
+    return t2 if t2 != t and MARK in t2 else t
 
 
 patch("FEXCore/Source/Interface/Core/Core.cpp", core)
@@ -66,3 +70,17 @@ def caspal(t):
 
 
 patch("FEXCore/Source/Utils/ArchHelpers/Arm64.cpp", caspal)
+
+
+# CompileBlock's [rpm-cas] probe calls rpm_cas_snapshot_take, which the fork's
+# rpmalloc defines; the native iOS build has no rpmalloc (allocator forced off
+# on Apple), so report "no snapshot".
+def rpm(t):
+    anchor = "int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);\n"
+    if t.count(anchor) != 1:
+        return t
+    return t.replace(anchor, anchor + f"#ifndef FEX_IOS_HOST {MARK}\n"
+                     "int rpm_cas_snapshot_take(struct rpm_cas_snapshot*) { return 0; }\n#endif\n")
+
+
+patch("FEXCore/Source/Interface/Core/Core.cpp", rpm)

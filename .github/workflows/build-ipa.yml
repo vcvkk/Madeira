@@ -238,9 +238,7 @@ jobs:
       - name: Build libdxmt_combined.a
         run: |
           set -eux
-          mv build/madeira-d3d12/deps.sh build/madeira-d3d12/deps.sh.off || true
           bash build/dxmt-ios/build.sh
-          mv build/madeira-d3d12/deps.sh.off build/madeira-d3d12/deps.sh || true
           xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a \
               build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
           cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
