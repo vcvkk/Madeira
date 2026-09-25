@@ -1,20 +1,10 @@
-name: Build IPA (unsigned)
+name: Build IPA
 
 on:
   workflow_dispatch:
-    inputs:
-      configuration:
-        description: "Xcode configuration (Debug is what runs games)"
-        required: false
-        default: "Debug"
-        type: choice
-        options:
-          - Debug
-          - Release
-
-permissions:
-  contents: read
-  actions: read
+  push:
+    paths:
+      - ".github/workflows/build-ipa.yml"
 
 jobs:
   build-ipa:
@@ -33,18 +23,8 @@ jobs:
         run: |
           xcodebuild -version
           sw_vers
-          df -h .
 
-      - name: Install build deps
-        run: |
-          set -euo pipefail
-          brew install cmake ninja flex bison pkg-config python3 coreutils || true
-          python3 -m pip install --break-system-packages --user packaging setuptools || true
-          echo "/opt/homebrew/opt/bison/bin" >> "$GITHUB_PATH"
-          echo "/opt/homebrew/opt/flex/bin" >> "$GITHUB_PATH"
-          echo "/opt/homebrew/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
-
-      - name: Fetch prebuilt host libs (GameHub CI artifacts)
+      - name: Fetch prebuilt host libs
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,7 +41,6 @@ jobs:
             if [ -z "$URL" ]; then echo "no artifact url"; return 1; fi
             curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -o "$dest.zip" "$URL"
             unzip -o "$dest.zip" -d "$dest"
-            ls -lh "$dest" || true
           }
 
           download_artifact ITZproVenom GameHub-iOS 34956261160 madeira-host-libs /tmp/prebuilt/core || true
@@ -80,7 +59,6 @@ jobs:
           if [ ! -f FEX/build-ios/FEXCore/Source/libJemallocLibs.a ]; then
             echo 'void madeira_jemalloc_stub(void){}' | xcrun -sdk iphoneos clang -arch arm64 -c -x c - -o /tmp/jemalloc_stub.o
             ar rcs FEX/build-ios/FEXCore/Source/libJemallocLibs.a /tmp/jemalloc_stub.o
-            echo "created stub libJemallocLibs.a"
           fi
 
           if [ -f /tmp/prebuilt/dxmt/libdxmt_combined.a ]; then
@@ -89,162 +67,41 @@ jobs:
             cp -v /tmp/prebuilt/dxmt/libdxmt_unix.a app/Madeira/libdxmt_combined.a
           fi
 
-          echo "=== Prebuilt placement ==="
-          find app/Madeira FEX/build-ios -name '*.a' -exec ls -lh {} \; 2>/dev/null || true
-
       - name: Provide x86_64-vcruntime folder
         run: |
           mkdir -p app/Madeira/x86_64-vcruntime
           touch app/Madeira/x86_64-vcruntime/.gitkeep
-          ls -la app/Madeira/x86_64-vcruntime
 
-      - name: Build libwin32u_unix.a (if missing)
-        continue-on-error: true
-        timeout-minutes: 40
+      - name: Stub libwin32u if missing
         run: |
-          set -uo pipefail
-          if [ -s app/Madeira/libwin32u_unix.a ]; then
-            ls -lh app/Madeira/libwin32u_unix.a
-            exit 0
-          fi
-          if [ ! -d wine ]; then
-            echo "wine submodule missing — cannot build win32u"
-            exit 0
-          fi
-          mkdir -p wine/build-macos/include
-          if [ ! -f wine/build-macos/include/config.h ]; then
-            {
-              echo '#ifndef WINE_CONFIG_H'
-              echo '#define WINE_CONFIG_H'
-              echo '#define HAVE_SYS_TYPES_H 1'
-              echo '#define HAVE_SYS_STAT_H 1'
-              echo '#define HAVE_STDLIB_H 1'
-              echo '#define HAVE_STRING_H 1'
-              echo '#define HAVE_UNISTD_H 1'
-              echo '#define HAVE_DLFCN_H 1'
-              echo '#define HAVE_PTHREAD_H 1'
-              echo '#define HAVE_SYS_MMAN_H 1'
-              echo '#define HAVE_SYS_SOCKET_H 1'
-              echo '#define HAVE_SYS_UN_H 1'
-              echo '#define HAVE_POLL 1'
-              echo '#define HAVE_MMAP 1'
-              echo '#endif'
-            } > wine/build-macos/include/config.h
-          fi
-          set +e
-          bash build/win32u-unix/build.sh 2>&1 | tee /tmp/win32u.log | tail -80
-          set -e
-          if [ -s app/Madeira/libwin32u_unix.a ]; then
-            ls -lh app/Madeira/libwin32u_unix.a
-            exit 0
-          fi
-          OBJ=build/win32u-unix/obj
-          if [ -d "$OBJ" ] && [ "$(find "$OBJ" -name '*.o' | wc -l | tr -d ' ')" -gt 0 ]; then
-            find "$OBJ" -name '*.o' -print0 | xargs -0 ar rcs app/Madeira/libwin32u_unix.a
-            ls -lh app/Madeira/libwin32u_unix.a
-          else
+          if [ ! -s app/Madeira/libwin32u_unix.a ]; then
             echo 'void madeira_win32u_stub(void){}' | xcrun -sdk iphoneos clang -arch arm64 -c -x c - -o /tmp/win32u_stub.o
             ar rcs app/Madeira/libwin32u_unix.a /tmp/win32u_stub.o
-            echo "created stub libwin32u_unix.a — app may not run games"
+            echo "stub libwin32u_unix.a"
           fi
+          ls -lh app/Madeira/*.a FEX/build-ios/FEXCore/Source/*.a 2>/dev/null || true
 
-      - name: Patch ContentView for Xcode 16 SDK (no glassEffect)
+      - name: Patch ContentView (no glassEffect on Xcode 16)
         run: |
-          # glassEffect is iOS 26+; Xcode 16.4 still type-checks the
-          # #available(iOS 26) branch and fails. Force material-only path.
-          python3 <<'PY'
+          python3 -c '
           from pathlib import Path
+          import re
           p = Path("app/Madeira/ContentView.swift")
           t = p.read_text()
-          old1 = '''    @ViewBuilder private var interior: some View {
-        if #available(iOS 26.0, *) {
-            Circle().fill(.clear).glassEffect(.regular, in: Circle())
-        } else {
-            Circle().fill(.ultraThinMaterial)
-        }
-    }'''
-          new1 = '''    @ViewBuilder private var interior: some View {
-        Circle().fill(.ultraThinMaterial)
-    }'''
-          old2 = '''struct GlassShape: View {
-    var circle = false
-    var body: some View {
-        if #available(iOS 26.0, *) {
-            if circle { Circle().fill(.clear).glassEffect(.regular, in: Circle()) }
-            else { RoundedRectangle(cornerRadius: 18).fill(.clear)
-                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18)) }
-        } else {
-            if circle { Circle().fill(.ultraThinMaterial) }
-            else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
-        }
-    }
-}'''
-          new2 = '''struct GlassShape: View {
-    var circle = false
-    var body: some View {
-        if circle { Circle().fill(.ultraThinMaterial) }
-        else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
-    }
-}'''
-          if old1 not in t:
-              print("WARN: interior glassEffect block not found exactly")
-          else:
-              t = t.replace(old1, new1)
-              print("patched interior")
-          if old2 not in t:
-              print("WARN: GlassShape glassEffect block not found exactly")
-          else:
-              t = t.replace(old2, new2)
-              print("patched GlassShape")
-          # Fallback: strip any remaining glassEffect lines
-          if "glassEffect" in t:
-              import re
-              t2 = re.sub(r'.*glassEffect.*\n', '', t)
-              if t2 != t:
-                  print("stripped residual glassEffect lines")
-                  t = t2
+          t = re.sub(r"if #available\(iOS 26\.0, \*\) \{[\s\S]*?\} else \{\s*", "", t)
+          t = re.sub(r".*glassEffect.*\n", "", t)
           p.write_text(t)
-          print("glassEffect remaining:", t.count("glassEffect"))
-          PY
-
-      - name: Inventory libs before xcodebuild
-        run: |
-          set -e
-          echo "=== Required paths ==="
-          for p in \
-            app/Madeira/libgmp.a \
-            app/Madeira/libgnutls.a \
-            app/Madeira/libhogweed.a \
-            app/Madeira/libnettle.a \
-            app/Madeira/libntdll_unix.a \
-            app/Madeira/libwineserver.a \
-            app/Madeira/libwin32u_unix.a \
-            app/Madeira/libdxmt_combined.a \
-            app/Madeira/x86_64-vcruntime \
-            FEX/build-ios/FEXCore/Source/libFEXCore.a \
-            FEX/build-ios/FEXCore/Source/libFEXCore_Base.a \
-            FEX/build-ios/FEXCore/Source/libJemallocLibs.a \
-            FEX/build-ios/External/fmt/libfmt.a \
-            FEX/build-ios/External/cephes/libcephes_128bit.a \
-            FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a \
-            FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a
-          do
-            if [ -e "$p" ]; then ls -ldh "$p"; else echo "MISSING $p"; fi
-          done
-
-      - name: List schemes
-        run: xcodebuild -project app/Madeira.xcodeproj -list
+          print("glassEffect left:", t.count("glassEffect"))
+          '
 
       - name: Archive (unsigned)
         run: |
           set -o pipefail
-          CONFIG="${{ github.event.inputs.configuration || 'Debug' }}"
-          echo "Configuration: $CONFIG"
           xcodebuild archive \
             -project app/Madeira.xcodeproj \
             -scheme Madeira \
-            -configuration "$CONFIG" \
-            -destination 'generic/platform=iOS' \
+            -configuration Debug \
+            -destination "generic/platform=iOS" \
             -archivePath build/Madeira.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -257,17 +114,9 @@ jobs:
         run: |
           set -e
           APP_PATH=$(find build/Madeira.xcarchive -name "Madeira.app" -type d | head -1)
-          if [ -z "$APP_PATH" ]; then
-            echo "::error::Madeira.app not found in archive"
-            find build/Madeira.xcarchive -type f 2>/dev/null | head -40
-            exit 1
-          fi
-          echo "Found: $APP_PATH"
-          ls -lh "$APP_PATH"
-          CONFIG="${{ github.event.inputs.configuration || 'Debug' }}"
-          IPA_NAME="Madeira-${CONFIG}-${{ github.run_number }}.ipa"
-          rm -rf Payload
-          mkdir Payload
+          test -n "$APP_PATH"
+          IPA_NAME="Madeira-Debug-${{ github.run_number }}.ipa"
+          rm -rf Payload && mkdir Payload
           cp -R "$APP_PATH" Payload/
           zip -r -q "$IPA_NAME" Payload
           rm -rf Payload
@@ -280,17 +129,3 @@ jobs:
           name: Madeira-ipa
           path: ${{ env.IPA_NAME }}
           retention-days: 14
-
-      - name: Summary
-        if: always()
-        run: |
-          {
-            echo "## Madeira IPA"
-            echo ""
-            echo "- Configuration: \`${{ github.event.inputs.configuration || 'Debug' }}\`"
-            echo "- Artifact: \`${{ env.IPA_NAME || 'n/a' }}\`"
-            echo "- glassEffect stripped for Xcode 16 SDK"
-            echo "- Unsigned — re-sign before install"
-            echo ""
-            ls -lh "${{ env.IPA_NAME }}" 2>/dev/null || echo "(no IPA)"
-          } >> "$GITHUB_STEP_SUMMARY"
