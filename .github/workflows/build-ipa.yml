@@ -36,6 +36,18 @@ jobs:
         with:
           submodules: recursive
 
+      # ContentView.swift uses glassEffect (iOS 26 SDK), so Xcode 16 cannot
+      # compile the app. Pick the newest Xcode 26+ on the image.
+      - name: Select Xcode 26
+        run: |
+          set -eu
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$X" ] || { echo "::error::No Xcode 26+ on this runner image"; exit 1; }
+          sudo xcode-select -s "$X/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
       - name: Host tools
         run: |
           set -eux
@@ -146,6 +158,12 @@ jobs:
             printf '%s\n' '/* generated during PE build; empty for host configure */' \
               > wine/dlls/ntdll/arm64ec_x64_export_iat.c
           fi
+
+          # The fork includes build/madeira_cfg.h ahead of config.h on purpose
+          # (ml1122); makedep's include-order sanity check rejects that and
+          # configure then writes no Makefile. Drop the check in CI only.
+          sed -i '' 's/fatal_error( "%s must be included before other headers\\n", file->name );/;/' wine/tools/makedep.c
+          ! grep -q 'must be included before other headers\\n", file->name' wine/tools/makedep.c
 
           mkdir -p wine/build-macos && cd wine/build-macos
           set +e
