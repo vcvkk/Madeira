@@ -47,7 +47,8 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
           # FEX Scripts/aarch64_fit_native.py needs packaging (or pkg_resources)
-          python3 -m pip install --user packaging setuptools
+          # Homebrew Python is externally managed (PEP 668).
+          python3 -m pip install --user --break-system-packages packaging setuptools
 
           LM="$HOME/llvm-mingw"
           if [ ! -x "$LM/bin/aarch64-w64-mingw32-clang" ]; then
