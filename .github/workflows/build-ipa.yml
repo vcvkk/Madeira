@@ -46,6 +46,9 @@ jobs:
           ln -sf "$(brew --prefix llvm)/bin/llvm-objcopy" "$RUNNER_TEMP/bin/llvm-objcopy"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
+          # FEX Scripts/aarch64_fit_native.py needs packaging (or pkg_resources)
+          python3 -m pip install --user packaging setuptools
+
           LM="$HOME/llvm-mingw"
           if [ ! -x "$LM/bin/aarch64-w64-mingw32-clang" ]; then
             URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-macos-universal.tar.xz"
@@ -138,15 +141,11 @@ jobs:
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           which aarch64-w64-mingw32-clang
 
-          # PE-side generated unit required by makedep path scan
           if [ ! -f wine/dlls/ntdll/arm64ec_x64_export_iat.c ]; then
             printf '%s\n' '/* generated during PE build; empty for host configure */' \
               > wine/dlls/ntdll/arm64ec_x64_export_iat.c
           fi
 
-          # madeira fork: makedep aborts on unix/sync.c include order while
-          # writing Makefile. config.status still emits include/config.h first —
-          # that is all ntdll-unix/wineserver compile lines need (-include config.h).
           mkdir -p wine/build-macos && cd wine/build-macos
           set +e
           ../configure --without-x --without-freetype --disable-tests --with-mingw=clang \
@@ -160,7 +159,6 @@ jobs:
             make -j"$(sysctl -n hw.ncpu)" include/all || make -C include all || true
           else
             echo "::warning::Wine Makefile missing (makedep exit); using config.h only"
-            # Ensure include/ has stamp so -I paths resolve
             mkdir -p include
             touch include/stamp-h
           fi
@@ -170,7 +168,11 @@ jobs:
           ls -la build-macos/include/config.h
 
       - name: Build FEXCore
-        run: bash build/fex-ios/build.sh
+        run: |
+          set -eux
+          # Ensure packaging is importable for FEX scripts
+          python3 -c "import packaging; print(packaging.__version__)"
+          bash build/fex-ios/build.sh
 
       - name: Build libntdll_unix.a
         run: |
