@@ -191,6 +191,15 @@ jobs:
           set -eux
           # Ensure packaging is importable for FEX scripts
           python3 -c "import packaging; print(packaging.__version__)"
+          # FEX fork: on Apple, CMake forces ENABLE_FEX_ALLOCATOR off, but the
+          # non-allocator malloc_usable_size still calls IOS_RPM_GUARD(), which
+          # is only defined in the allocator branch. Provide the no-op in CI.
+          F=FEX/FEXCore/Source/Utils/AllocatorHooks.cpp
+          grep -q 'CI: IOS_RPM_GUARD fallback' "$F" || {
+            printf '%s\n' '#ifndef ENABLE_FEX_ALLOCATOR /* CI: IOS_RPM_GUARD fallback */' \
+                           '#define IOS_RPM_GUARD() ((void)0)' '#endif' | cat - "$F" > "$F.tmp"
+            mv "$F.tmp" "$F"
+          }
           bash build/fex-ios/build.sh
 
       - name: Build libntdll_unix.a
