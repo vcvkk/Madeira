@@ -41,14 +41,23 @@ jobs:
           echo "/opt/homebrew/opt/bison/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/opt/flex/bin" >> "$GITHUB_PATH"
           echo "/opt/homebrew/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
-          if [ ! -x "$HOME/llvm-mingw/bin/aarch64-w64-mingw32-clang" ]; then
-            curl -fsSL -o /tmp/llvm-mingw.tar.xz \
-              "https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-macos-universal.tar.xz"
-            mkdir -p "$HOME/llvm-mingw"
-            tar -xJf /tmp/llvm-mingw.tar.xz -C "$HOME/llvm-mingw" --strip-components=1
+
+          LM="$HOME/llvm-mingw"
+          CLANG="$LM/bin/aarch64-w64-mingw32-clang"
+          if [ ! -x "$CLANG" ]; then
+            URL="https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-macos-universal.tar.xz"
+            echo "Downloading $URL"
+            curl -fL --retry 3 -o /tmp/llvm-mingw.tar.xz "$URL"
+            ls -lh /tmp/llvm-mingw.tar.xz
+            rm -rf "$LM"
+            mkdir -p "$LM"
+            tar -xJf /tmp/llvm-mingw.tar.xz -C "$LM" --strip-components=1
+            ls -la "$LM/bin" | head -20
           fi
-          echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
-          aarch64-w64-mingw32-clang --version | head -1
+          test -x "$CLANG"
+          echo "$LM/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH applies to *next* steps; use full path here
+          "$CLANG" --version | head -2
 
       - name: Generate FEX config headers
         run: |
@@ -91,6 +100,7 @@ jobs:
         timeout-minutes: 45
         run: |
           set -euo pipefail
+          export PATH="$HOME/llvm-mingw/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
           bash build/wineserver/build.sh
           test -s app/Madeira/libwineserver.a
           ls -lh app/Madeira/libwineserver.a
@@ -99,6 +109,7 @@ jobs:
         timeout-minutes: 45
         run: |
           set -euo pipefail
+          export PATH="$HOME/llvm-mingw/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
           bash build/win32u-unix/build.sh
           test -s app/Madeira/libwin32u_unix.a
           ls -lh app/Madeira/libwin32u_unix.a
@@ -111,7 +122,6 @@ jobs:
           test -s FEX/build-ios/FEXCore/Source/libFEXCore.a
           test -s FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
           ls -lh FEX/build-ios/FEXCore/Source/*.a
-          # Jemalloc if produced under another name — require real archive
           if [ ! -s FEX/build-ios/FEXCore/Source/libJemallocLibs.a ]; then
             echo "::error::libJemallocLibs.a missing after FEX build"
             find FEX/build-ios -name '*.a' | head -50
@@ -129,11 +139,9 @@ jobs:
           mkdir -p toolchains
           if [ ! -d toolchains/llvm-project/.git ]; then
             git clone --depth 1 https://github.com/llvm/llvm-project.git toolchains/llvm-project
-            # Prefer pinned commit from BUILDING.md if reachable
             git -C toolchains/llvm-project fetch --depth 1 origin 8dfdcc7b7 || true
             git -C toolchains/llvm-project checkout 8dfdcc7b7 || git -C toolchains/llvm-project checkout HEAD
           fi
-          # Host tablegen first
           cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_TARGETS_TO_BUILD=AArch64 \
@@ -186,7 +194,6 @@ jobs:
           set -euo pipefail
           DEST=app/Madeira/x86_64-vcruntime
           mkdir -p "$DEST"
-          # Official redist; extract DLLs if 7z available — folder must exist for Xcode
           brew install sevenzip || true
           TMP=/tmp/vcredist
           mkdir -p "$TMP"
@@ -200,7 +207,6 @@ jobs:
               esac
             done
           fi
-          # Must not be empty for some CpResource checks — keep at least one real file if extract worked
           ls -la "$DEST"
 
       - name: Require real libs (fail if any missing)
