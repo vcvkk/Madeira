@@ -4525,8 +4525,18 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             uint32_t i0, i1, i2;
             unsigned reg;
 
-            if (data_map && (data_map[i / 4] || data_map[(i + 4) / 4] || data_map[(i + 8) / 4]))
+            /* data_map is a BITMAP (one bit per word, text_size/32+1 bytes), as
+             * ios_x18_build_data_map builds it and the x18 pass reads it. This
+             * used to index it as one byte per word, which reads far past the
+             * buffer once i/4 exceeds text_size/32: for FEX's asm stubs at the
+             * end of a 2MB .text that was heap garbage, so the reads were
+             * skipped as "data" in some copies (found=0, no log line), enter_jit
+             * kept slot 275, and steamwebhelper's chrome_elf.dll faulted on
+             * [0x1788] during DLL init. */
+#define IOS_DATA_WORD(off) (data_map[((off) / 4) >> 3] & (1 << (((off) / 4) & 7)))
+            if (data_map && (IOS_DATA_WORD(i) || IOS_DATA_WORD(i + 4) || IOS_DATA_WORD(i + 8)))
                 continue;
+#undef IOS_DATA_WORD
 
             i0 = *(uint32_t *)(text_rw + i);
             if ((i0 & 0xffffffe0) != 0xd53bd060) continue;      /* mrs xN, TPIDRRO_EL0 */
