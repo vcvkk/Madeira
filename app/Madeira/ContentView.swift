@@ -1159,6 +1159,14 @@ struct ContentView: View {
                     // ml589: find Steam and (re)write the launch batch. Returns
                     // false — having logged why — when there is nothing to run.
                     guard prepareSteamLaunch() else { return }
+                    // Steam's images are all relocatable (steam.exe loaded at
+                    // 0x122c00000, steamwebhelper at 0x12a450000), so the
+                    // 0x140000000 window kept for fixed-base games only splits
+                    // the low gap. With it held the iPhone 18 Pro could place
+                    // just a 592MB pool, which ran out loading steamwebhelper
+                    // ("[jit-pool] EXHAUSTED"), leaving the child's ntdll
+                    // non-executable and the app dead. Unsplit, 896MB fits.
+                    setenv("MADEIRA_NO_EXE_WINDOW", "1", 1)
                     // ml590 STEP 1 (one-run phase check, NOT a timing measurement):
                     // arm the ml578 sock-wire probe. It answers exactly one
                     // question — does today's ~1s CM failure reach the same TLS
