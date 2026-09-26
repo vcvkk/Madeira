@@ -316,6 +316,24 @@ jobs:
               --notes "Unsigned $CONFIGURATION IPA from ${GITHUB_SHA::7} on ${GITHUB_REF_NAME}, ${STEAM_NOTE}. Sign it with your own Apple ID when sideloading. Built by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
               $PRERELEASE
 
+      # Keep the newest KEEP_RELEASES build-* releases and delete the rest
+      # together with their tags. Releases with other tags (made by hand)
+      # are never touched.
+      - name: Delete old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP_RELEASES: 5
+        run: |
+          set -eu
+          gh release list --limit 1000 --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("build-"))]
+                    | sort_by(.createdAt) | reverse
+                    | .['"$KEEP_RELEASES"':][] | .tagName' |
+          while read -r tag; do
+            echo "Deleting release $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done
+
       - name: Show compiler errors
         if: failure()
         run: |
