@@ -6746,6 +6746,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                                                          EXCEPTION_RECORD *rec, TEB *teb );
     extern const struct ios_ntdll_funcs *ios_ntdll_funcs_for_peb( void *peb_id );
     extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+    extern BOOL ios_peb_is_dead_child( void *peb );
 
     uint64_t pc = arm_thread_state64_get_pc( *state );
     uintptr_t rxb = (uintptr_t)ios_jit_rx_base_global;
@@ -7273,6 +7274,26 @@ dispatch:
         else if (++redeliv[rslot].n == 256)
             dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",
                      (unsigned long long)pc, (unsigned long long)fault_addr );
+        else if (redeliv[rslot].n >= 2000 && !ios_redeliv_terminating &&
+                 thread_teb > 0x10000 && ios_peb_is_dead_child( *(void **)(thread_teb + 0x60) ))
+        {
+            /* A laggard thread of a pseudo-process that has already exited:
+             * process_exit_wrapper reclaimed its module copies, so it faults
+             * on code that no longer exists and can never make progress.
+             * Seen after steamwebhelper aborted on a PartitionAlloc CHECK
+             * (int3, 0x80000003): Wine terminated the process, one thread kept
+             * executing the freed ntdll copy ([xlate-exec] copy pe=0x0), and
+             * the task_terminate below took Steam and the whole app with it.
+             * The process is gone either way; stop only this thread so the
+             * rest (steam.exe, which respawns its webhelper) survives. */
+            dprintf( 2, "[redeliv] 2000 identical redeliveries pc=0x%llx on a thread of EXITED pseudo-process peb=%p -- "
+                        "terminating that thread only, not the app\n",
+                     (unsigned long long)pc, *(void **)(thread_teb + 0x60) );
+            redeliv[rslot].key = 0;
+            redeliv[rslot].n = 0;
+            thread_terminate( thread );
+            return 1;  /* the caller's set_state/reply on the dead thread just fails */
+        }
         else if (redeliv[rslot].n >= 2000 && !ios_redeliv_terminating)
         {
             /* ml463: was `== 2000` + exit(76) — one shot, and exit() on iOS is
