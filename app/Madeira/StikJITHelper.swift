@@ -332,7 +332,17 @@ enum StikJITHelper {
             // held, the placeholder's run merged with the free space below it and
             // the old test plugged the only hole that fit (every launch of ml1095
             // ended in the guest window). Plug only holes ending below the placeholder.
-            if earlyPoolBase != 0 && windowHeld {
+            // Plugging is only useful when a hole at or above the placeholder can
+            // hold the pool. When the placeholder came up short (an intruder sat
+            // above the window before this image loaded, e.g. 272MB placeholder,
+            // pool shrunk to the 490MB lower hole), the lower hole IS the only
+            // fit: plugging it pushed first-fit to 0x7000000000 on every attempt
+            // and the launch aborted. A pool below the window is valid (ml1135).
+            let upperFits = holes.contains { $0.base + $0.size > earlyPoolBase && $0.size >= vm_address_t(poolSize) }
+            if earlyPoolBase != 0 && windowHeld && !upperFits {
+                LogStore.shared.log("ml1040: no hole above the window fits the pool — leaving lower holes open")
+            }
+            if earlyPoolBase != 0 && windowHeld && upperFits {
                 for h in holes where h.base + h.size <= earlyPoolBase && h.size >= vm_address_t(poolSize) {
                     var a = h.base
                     if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* FIXED */) == KERN_SUCCESS && a == h.base {
