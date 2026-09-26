@@ -28,6 +28,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Compiler cache (see the ccache steps). BASEDIR keeps cached paths
+  # relative so hits survive a different workspace path. The default
+  # compiler check (mtime+size) re-keys everything when Xcode changes.
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_MAXSIZE: 3G
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
   LLVM_VERSION: 15.0.7
   FREETYPE_TAG: VER-2-13-3
   CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
@@ -43,8 +51,22 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # Submodules by hand so FEX's test-binary repos and Catch2 (unused with
+      # BUILD_TESTING=OFF, and the bulk of the download) are skipped.
+      - name: Submodules
+        run: |
+          set -eux
+          git submodule update --init --depth 1 wine research/dxmt FEX
+          git -C wine submodule update --init --recursive --depth 1
+          git -C research/dxmt submodule update --init --recursive --depth 1
+          git -C FEX \
+            -c submodule.External/fex-posixtest-bins.update=none \
+            -c submodule.External/fex-gvisor-tests-bins.update=none \
+            -c submodule.External/fex-gcc-target-tests-bins.update=none \
+            -c submodule.External/Catch2.update=none \
+            submodule update --init --recursive --depth 1
+          git submodule status --recursive | grep -v '^-' | head -40
 
       # ContentView.swift uses glassEffect (iOS 26 SDK), so Xcode 16 cannot
       # compile the app. Pick the newest Xcode 26+ on the image.
@@ -62,6 +84,12 @@ jobs:
           xcrun -sdk macosx metal --version 2>/dev/null \
             || sudo xcodebuild -downloadComponent MetalToolchain
           xcrun -sdk macosx metal --version
+
+      - name: Restore llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: ~/llvm-mingw
+          key: llvm-mingw-20240619-ucrt-macos-universal
 
       - name: Host tools
         run: |
@@ -89,6 +117,23 @@ jobs:
           export PATH="$LM/bin:$PATH"
           aarch64-w64-mingw32-clang --version | head -1
           xcodebuild -version
+
+      # One cache entry per run; each run starts from the newest earlier one.
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Route xcrun clang through ccache
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/ccache-bin"
+          cp scripts/ci/xcrun-ccache "$RUNNER_TEMP/ccache-bin/xcrun"
+          echo "$RUNNER_TEMP/ccache-bin" >> "$GITHUB_PATH"
+          ccache --zero-stats
+          ccache --show-config | grep -E "cache_dir|base_dir|max_size"
 
       - name: Restore LLVM (iOS) cache
         id: llvm-cache
@@ -285,7 +330,7 @@ jobs:
           codesign --force --sign - --entitlements app/Madeira/Madeira.entitlements "$APP" || true
           rm -rf ipa && mkdir -p ipa/Payload
           cp -R "$APP" ipa/Payload/
-          (cd ipa && zip -qry "../Madeira-$CONFIGURATION-unsigned.ipa" Payload)
+          (cd ipa && zip -qry -1 "../Madeira-$CONFIGURATION-unsigned.ipa" Payload)
           ls -lh Madeira-*.ipa
 
       - uses: actions/upload-artifact@v4
@@ -333,6 +378,10 @@ jobs:
             echo "Deleting release $tag"
             gh release delete "$tag" --cleanup-tag --yes
           done
+
+      - name: Compiler cache stats
+        if: always()
+        run: ccache --show-stats || true
 
       - name: Show compiler errors
         if: failure()
