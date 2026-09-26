@@ -1,0 +1,177 @@
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index fbaf76f..8b9ca4f 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -949,7 +949,7 @@ NTSTATUS ProcessInit() {
+  * __DATE__/__TIME__ below is compiler-generated and therefore the
+  * authoritative identity; if the two disagree, the tag is wrong, not the
+  * build. */
+-#define MADEIRA_REV "ml908"
++#define MADEIRA_REV "ml908+xreent"
+   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
+ #ifdef FEX_IOS_HOST
+   /* ml751: flush the VA band selector's beacons.
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 003dc35..8de5fe6 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -25,6 +25,58 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
+ #endif
+ 
+ namespace FEX::Windows {
++namespace {
++/* iOS-Madeira: IntervalsLock RE-ENTRY FROM FEX'S OWN MEMORY NOTIFICATIONS.
++ *
++ * Steam froze at startup (steam.exe main thread parked forever, cmd window left open) with
++ * this as the last output of the thread:
++ *
++ *   [iOS-xins] tracker=0x14e63dff0 rpcrt4.dll sec=0x71f7f10000-0x71f7f5b27f
++ *   [vfree] ml842 # base=0x7c010c1000 size=0xf000 type=0x4000 tid=005c
++ *   [waiters]  tid=005c addr=0x14e63e028 age=284s INF   <- tracker+0x38, inside IntervalsLock
++ *
++ * HandleImageMap() logs while holding IntervalsLock exclusively. Formatting that line made
++ * FEX's allocator decommit one of its own arena pages, NtFreeVirtualMemory called back into
++ * NotifyMemoryFree -> InvalidateAlignedInterval(), which takes IntervalsLock again on the same
++ * thread: a non-recursive shared_mutex, so the thread waited on itself forever. Any allocation
++ * under the lock (an IntervalList growing, for instance) can do the same.
++ *
++ * Record the exclusive owner, and have the notification entry points skip the work when the
++ * current thread is that owner. Only FEX runs on a thread inside this tracker's critical
++ * section, so such a notification is FEX's own heap (the FEX_ONLY arena), never guest code:
++ * there is no executable interval to drop and no translated code to invalidate. */
++class IntervalsWriteScope {
++public:
++  explicit IntervalsWriteScope(std::atomic<DWORD>& Owner)
++    : Owner {Owner} {
++    Owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
++  }
++  ~IntervalsWriteScope() {
++    Owner.store(0, std::memory_order_relaxed);
++  }
++  IntervalsWriteScope(const IntervalsWriteScope&) = delete;
++  IntervalsWriteScope& operator=(const IntervalsWriteScope&) = delete;
++
++private:
++  std::atomic<DWORD>& Owner;
++};
++
++void LogReentrantSkip(const char* Path, uint64_t Address, uint64_t Size) {
++  static std::atomic<uint32_t> Count {0};
++  const auto N = Count.fetch_add(1, std::memory_order_relaxed) + 1;
++  // Few lines only: the log call itself allocates and can come straight back here.
++  if (N <= 4) {
++    LogMan::Msg::EFmt("[iOS-xreent] {} #{} {:#x}+{:#x} skipped: this thread already holds IntervalsLock", Path, N, Address, Size);
++  }
++}
++} // namespace
++
++bool InvalidationTracker::ThreadHoldsIntervalsWrite() const {
++  // Only the owner stores its own id, so a relaxed load can only match on that very thread.
++  const DWORD Tid = GetCurrentThreadId();
++  return Tid && IntervalsWriterTid.load(std::memory_order_relaxed) == Tid;
++}
++
+ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
+   : CTX {CTX}
+   , Threads {Threads} {
+@@ -58,11 +110,16 @@ static bool ProtIsWritable(ULONG Prot) {
+ }
+ 
+ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
++  if (ThreadHoldsIntervalsWrite()) {
++    LogReentrantSkip("protect", Address, Size);
++    return;
++  }
+   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+ 
+   const bool NeedsInvalidate = [&]() {
+     std::unique_lock Lock(IntervalsLock);
++    IntervalsWriteScope WriteScope(IntervalsWriterTid);
+ 
+     FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
+ 
+@@ -127,6 +184,7 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
+ 
+   std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+   std::unique_lock Lock(IntervalsLock);
++  IntervalsWriteScope WriteScope(IntervalsWriterTid);
+ 
+   if (DisableDEP == DEPDisabled) {
+     return;
+@@ -180,6 +238,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
+   for (auto* Section = SectionsBegin; Section != SectionsEnd; Section++) {
+     if (Section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+       std::unique_lock Lock(IntervalsLock);
++      IntervalsWriteScope WriteScope(IntervalsWriterTid);
+ 
+       uint64_t SectionBase = Address + Section->VirtualAddress;
+       uint64_t SectionEnd = SectionBase + Section->Misc.VirtualSize;
+@@ -328,6 +387,10 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
+ }
+ 
+ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free) {
++  if (ThreadHoldsIntervalsWrite()) {
++    LogReentrantSkip("section", Address, 0);
++    return {Address, 0};
++  }
+   MEMORY_BASIC_INFORMATION Info;
+   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
+     return {Address, 0};
+@@ -346,6 +409,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+ 
+   if (Free) {
+     std::unique_lock Lock(IntervalsLock);
++    IntervalsWriteScope WriteScope(IntervalsWriterTid);
+     LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this),
+                       SectionBase, SectionBase + SectionSize);
+     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+@@ -356,6 +420,10 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+ }
+ 
+ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
++  if (ThreadHoldsIntervalsWrite()) {
++    LogReentrantSkip("aligned", Address, Size);
++    return;
++  }
+   if (!Address) {
+     // Match the Windows behaviour when passed a NULL base address.
+     Size = std::numeric_limits<uint64_t>::max();
+@@ -368,6 +436,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+ 
+   if (Free) {
+     std::unique_lock Lock(IntervalsLock);
++    IntervalsWriteScope WriteScope(IntervalsWriterTid);
+     // ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
+     // unconditional) — ml436 logged 4,234 lines of ordinary heap decommit
+     // churn, drowning the log and costing a dprintf syscall per free. The
+@@ -504,6 +573,7 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
+ 
+ void InvalidationTracker::DisableSMCDetection() {
+   std::unique_lock Lock(IntervalsLock);
++  IntervalsWriteScope WriteScope(IntervalsWriterTid);
+   SMCDetectionDisabled = true;
+   uint64_t Address = 0;
+ 
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bc..df7076d 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -3,6 +3,7 @@
+ 
+ #include <FEXCore/Utils/IntervalList.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
++#include <atomic>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <unordered_map>
+@@ -61,6 +62,9 @@ private:
+   FEXCore::IntervalList<uint64_t> XIntervals;
+   FEXCore::IntervalList<uint64_t> RWXIntervals;
+   std::shared_mutex IntervalsLock;
++  // iOS-Madeira: id of the thread holding IntervalsLock exclusively, 0 when none. See ThreadHoldsIntervalsWrite().
++  std::atomic<DWORD> IntervalsWriterTid {0};
++  bool ThreadHoldsIntervalsWrite() const;
+   FEXCore::Context::Context& CTX;
+   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
+   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
