@@ -191,7 +191,11 @@ enum StikJITHelper {
         func overlapsExeWindow(_ base: vm_address_t, _ len: vm_address_t) -> Bool {
             return base < exeWinBase + exeWinSize && base + len > exeWinBase
         }
-        let skipWindow = (ProcessInfo.processInfo.environment["MADEIRA_NO_EXE_WINDOW"].map { $0 != "0" } ?? false)
+        // getenv, not ProcessInfo.environment: Foundation snapshots the environment on first
+        // use, so a setenv made at launch time (the Steam button) was invisible to it and
+        // the window stayed held.
+        let skipWindow = getenv("MADEIRA_NO_EXE_WINDOW").map { String(cString: $0) != "0" } ?? false
+        LogStore.shared.log("executable window: \(skipWindow ? "SKIPPED (MADEIRA_NO_EXE_WINDOW)" : "wanted")")
         var windowHeld = false
         if skipWindow && madeira_early_window_base == UInt(exeWinBase) && madeira_early_window_size == UInt(exeWinSize) {
             // The image-load constructor held the window unconditionally. Give it back, or it
