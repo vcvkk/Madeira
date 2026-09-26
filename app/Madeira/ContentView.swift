@@ -2406,6 +2406,30 @@ struct ContentView: View {
             ("C:\\Program Files\\Steam",       "\(prefix)/drive_c/Program Files/Steam"),
         ]
 
+        // CI IPAs carry a 64-bit Steam folder at Madeira.app/Steam
+        // (scripts/fetch-steam.sh). Install it into the prefix on first use:
+        // Steam writes config, logs and updates into its own directory, so it
+        // cannot run from the read-only bundle. Copied under a temporary name
+        // and renamed, so an interrupted copy is never mistaken for an install.
+        let bundledSteam = Bundle.main.bundlePath + "/Steam"
+        if !candidates.contains(where: { fm.fileExists(atPath: "\($0.1)/steam.exe") }),
+           fm.fileExists(atPath: "\(bundledSteam)/steam.exe") {
+            let dest = candidates[0].1
+            let staging = dest + ".partial"
+            logStore.log("Installing bundled Steam into the prefix...")
+            do {
+                try fm.createDirectory(atPath: (dest as NSString).deletingLastPathComponent,
+                                       withIntermediateDirectories: true)
+                try? fm.removeItem(atPath: staging)
+                try fm.copyItem(atPath: bundledSteam, toPath: staging)
+                try? fm.removeItem(atPath: dest)
+                try fm.moveItem(atPath: staging, toPath: dest)
+                logStore.log("Bundled Steam installed", level: .success)
+            } catch {
+                logStore.log("Could not install bundled Steam: \(error.localizedDescription)", level: .error)
+            }
+        }
+
         guard let (winDir, _) = candidates.first(where: {
             fm.fileExists(atPath: "\($0.1)/steam.exe")
         }) else {

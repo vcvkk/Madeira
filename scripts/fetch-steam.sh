@@ -55,6 +55,26 @@ while read -r file sha; do
     rm -f "$WORK_DIR/$file"
 done < "$WORK_DIR/list"
 
+# Some of Valve's zips store directory entries with Windows '\' separators.
+# Info-ZIP unzip normalizes them; this catches any unzip that does not.
+python3 - "$OUT_DIR" <<'EOF'
+import os, shutil, sys
+for dp, dns, fns in os.walk(sys.argv[1], topdown=False):
+    for name in fns + dns:
+        if '\\' not in name:
+            continue
+        src = os.path.join(dp, name)
+        dst = os.path.join(dp, *name.split('\\'))
+        if os.path.isdir(src):
+            os.makedirs(dst, exist_ok=True)
+            for x in os.listdir(src):
+                shutil.move(os.path.join(src, x), os.path.join(dst, x))
+            os.rmdir(src)
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+EOF
+
 cp "$WORK_DIR/manifest" "$OUT_DIR/package/$MANIFEST_NAME.manifest"
 cp "$WORK_DIR/manifest" "$OUT_DIR/package/$MANIFEST_NAME.installed"
 
