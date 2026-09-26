@@ -32,6 +32,11 @@ env:
   FREETYPE_TAG: VER-2-13-3
   CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
 
+# contents: write lets the job create the release (the default token may be
+# read-only).
+permissions:
+  contents: write
+
 jobs:
   ipa:
     runs-on: macos-15
@@ -288,6 +293,28 @@ jobs:
           name: Madeira-${{ env.CONFIGURATION }}-ipa
           path: Madeira-*.ipa
           compression-level: 0
+
+      # Every successful build becomes a release tagged build-<run number> on
+      # the built commit. Only main builds are full releases (and "Latest");
+      # builds of other branches are published as prereleases.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          STEAM_NOTE="no Steam"
+          if [ -f "$RUNNER_TEMP/Steam/package/steam_client_win64.manifest" ]; then
+            STEAM_NOTE="Steam client $(sed -n 's/^[[:space:]]*"version"[[:space:]]*"\([0-9]*\)".*/\1/p' \
+              "$RUNNER_TEMP/Steam/package/steam_client_win64.manifest" | head -1)"
+          fi
+          PRERELEASE=""
+          [ "$GITHUB_REF" = "refs/heads/main" ] || PRERELEASE="--prerelease"
+          gh release create "$TAG" Madeira-*.ipa \
+              --target "$GITHUB_SHA" \
+              --title "Madeira $CONFIGURATION #${GITHUB_RUN_NUMBER} (${GITHUB_REF_NAME})" \
+              --notes "Unsigned $CONFIGURATION IPA from ${GITHUB_SHA::7} on ${GITHUB_REF_NAME}, ${STEAM_NOTE}. Sign it with your own Apple ID when sideloading. Built by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              $PRERELEASE
 
       - name: Show compiler errors
         if: failure()
