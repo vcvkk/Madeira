@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <sys/stat.h>
 /* iOS-Madeira: SecTrustSettingsCopyCertificates / SecItemExport are
  * macOS-only — the iOS SDK has no API to enumerate system root CAs at
@@ -850,26 +851,61 @@ static void load_root_certs(void)
         import_certs_from_path( CRYPT_knownLocations[i], TRUE );
 }
 
+/* iOS-Madeira: every Windows process here shares this ONE unix library, so the
+ * upstream "hand out the head and free it" enumeration gave the whole list to
+ * the first process and STATUS_NO_MORE_ENTRIES to every later one. crypt32's
+ * sync_trusted_roots_from_known_locations() treats that empty answer as "the
+ * host removed these roots" and deletes every host-imported root from the
+ * shared registry store, so by the time steam.exe verified a chain only the
+ * built-in Microsoft roots were left: "Crypto API failed certificate check,
+ * error flags 0x00010000" (CERT_TRUST_IS_PARTIAL_CHAIN) for every Steam host,
+ * no CM connection, and "wrong password" at login.
+ *
+ * Keep the list and walk it with a cursor instead; the end of a walk rewinds
+ * it, so each process's enumeration sees the full set. Enumerations are
+ * serialized by crypt32's named "crypt32_root_semaphore"; the mutex only keeps
+ * the cursor itself consistent. */
+static pthread_mutex_t root_cert_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list *root_cert_cursor;
+static BOOL root_cert_walking;
+
 static NTSTATUS enum_root_certs( void *args )
 {
     struct enum_root_certs_params *params = args;
     static BOOL loaded;
-    struct list *ptr;
     struct root_cert *cert;
+    NTSTATUS status = STATUS_SUCCESS;
 
-    if (!loaded) load_root_certs();
-    loaded = TRUE;
-
-    if (!(ptr = list_head( &root_cert_list ))) return STATUS_NO_MORE_ENTRIES;
-    cert = LIST_ENTRY( ptr, struct root_cert, entry );
-    *params->needed = cert->size;
-    if (cert->size <= params->size)
+    pthread_mutex_lock( &root_cert_lock );
+    if (!loaded)
     {
-        memcpy( params->buffer, cert->data, cert->size );
-        list_remove( &cert->entry );
-        free( cert );
+        load_root_certs();
+        loaded = TRUE;
     }
-    return STATUS_SUCCESS;
+    if (!root_cert_walking)
+    {
+        root_cert_cursor = list_head( &root_cert_list );
+        root_cert_walking = TRUE;
+    }
+
+    if (!root_cert_cursor)
+    {
+        root_cert_walking = FALSE;  /* end of this walk; the next call rewinds */
+        status = STATUS_NO_MORE_ENTRIES;
+    }
+    else
+    {
+        cert = LIST_ENTRY( root_cert_cursor, struct root_cert, entry );
+        *params->needed = cert->size;
+        /* Too small a buffer: report the size and stay on this cert, as upstream. */
+        if (cert->size <= params->size)
+        {
+            memcpy( params->buffer, cert->data, cert->size );
+            root_cert_cursor = list_next( &root_cert_list, root_cert_cursor );
+        }
+    }
+    pthread_mutex_unlock( &root_cert_lock );
+    return status;
 }
 
 const unixlib_entry_t __wine_unix_call_funcs[] =
