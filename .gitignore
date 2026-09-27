@@ -143,3 +143,4 @@ app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
 app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
 research/madeira-d3d12/tests/offline/sm51/
 build/steamservice/steamservice-x64.exe
+build/steamservice/steamservice-arm64.exe
