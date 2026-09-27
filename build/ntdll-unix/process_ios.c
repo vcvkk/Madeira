@@ -976,6 +976,64 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
     }
 
+    /* Steam runs a game's first-launch install script through
+     *   bin\SteamService.exe /installscript "<...>\runasadmin.vdf" <appid>
+     * SteamService.exe is 32-bit, so the i386 refusal below turns every game
+     * launch into "Error Invalid handle". The scripts only install the VC++
+     * redistributables and DirectX, which this port replaces with builtin DLLs
+     * and DXMT, so run a 64-bit no-op in its place (cmd.exe /c exit 0): Steam
+     * sees the script process exit 0 and goes on to start the game. */
+    {
+        static const char svc[] = "steamservice.exe";
+        static const char isw[] = "/installscript";
+        static WCHAR nt_cmd[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
+                                 's','y','s','t','e','m','3','2','\\','c','m','d','.','e','x','e',0};
+        static WCHAR dos_cmd[] = {'C',':','\\','w','i','n','d','o','w','s','\\','s','y','s','t','e','m','3','2','\\',
+                                  'c','m','d','.','e','x','e',0};
+        static WCHAR noop_cl[] = {'C',':','\\','w','i','n','d','o','w','s','\\','s','y','s','t','e','m','3','2','\\',
+                                  'c','m','d','.','e','x','e',' ','/','c',' ','e','x','i','t',' ','0',0};
+        const WCHAR *ip = params->ImagePathName.Buffer;
+        const WCHAR *cl = params->CommandLine.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
+        int cl_len = params->CommandLine.Length / sizeof(WCHAR);
+        int sl = sizeof(svc) - 1, il = sizeof(isw) - 1, k, j, is_svc = 0, is_script = 0;
+
+        for (k = 0; k + sl <= ip_len && !is_svc; k++)
+        {
+            for (j = 0; j < sl; j++)
+            {
+                WCHAR c = ip[k + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)svc[j]) break;
+            }
+            if (j == sl) is_svc = 1;
+        }
+        for (k = 0; is_svc && k + il <= cl_len && !is_script; k++)
+        {
+            for (j = 0; j < il; j++)
+            {
+                WCHAR c = cl[k + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)isw[j]) break;
+            }
+            if (j == il) is_script = 1;
+        }
+        if (is_script)
+        {
+            dprintf( 2, "[proc-gate] SteamService /installscript -> cmd.exe /c exit 0 (was %s)\n",
+                     debugstr_us( &params->CommandLine ) );
+            path.Buffer = nt_cmd;
+            path.Length = sizeof(nt_cmd) - sizeof(WCHAR);
+            path.MaximumLength = sizeof(nt_cmd);
+            params->ImagePathName.Buffer = dos_cmd;
+            params->ImagePathName.Length = sizeof(dos_cmd) - sizeof(WCHAR);
+            params->ImagePathName.MaximumLength = sizeof(dos_cmd);
+            params->CommandLine.Buffer = noop_cl;
+            params->CommandLine.Length = sizeof(noop_cl) - sizeof(WCHAR);
+            params->CommandLine.MaximumLength = sizeof(noop_cl);
+        }
+    }
+
     /* ml526: stamp every accepted spawn on the startup timeline. This is the
      * boundary the coarse phase accounting could not see — steam.exe -> the
      * webhelper spawn was a ~16s block with no internal detail. */
