@@ -101,6 +101,12 @@ jobs:
             !FEX/build-ios/**/*.o
           key: native-${{ env.NATIVE_CACHE_VERSION }}-${{ steps.keys.outputs.xcode }}-${{ steps.keys.outputs.subs }}-${{ hashFiles('build/**', '!build/steamservice/**', '!build/proc-tests/**', '!build/x64-tests/**', '!build/d3d11-triangle/**', '!build/dxmt-tests/**', '!build/host-tests/**', '!build/net-tests/**', '!build/wine-pe/**', '!build/fex-arm64ec/**', 'research/madeira-d3d12/**', 'scripts/ci/**') }}
 
+      # The FEX gitfile can come back from the cache and points at a
+      # .git/modules/FEX this checkout does not have.
+      - name: Drop restored FEX gitfile
+        if: steps.native.outputs.cache-hit == 'true'
+        run: rm -rf FEX/.git
+
       # Everything from here to "Save native libraries" runs only on a miss.
       - name: Restore submodule objects
         if: steps.native.outputs.cache-hit != 'true'
@@ -402,31 +408,63 @@ jobs:
             !FEX/build-ios/**/*.o
           key: ${{ steps.native.outputs.cache-primary-key }}
 
-      - name: Build Madeira.app
+      # Xcode 26 compilation caching: the CAS survives between runs, so
+      # unchanged Swift/ObjC files are not recompiled even though a fresh
+      # checkout gives every file a new mtime.
+      - name: Restore Xcode compilation cache
+        id: xc-cas
+        uses: actions/cache/restore@v4
+        with:
+          path: app/xc-cas
+          key: xc-cas-v1-${{ steps.keys.outputs.xcode }}-${{ env.CONFIGURATION }}-${{ github.run_id }}
+          restore-keys: xc-cas-v1-${{ steps.keys.outputs.xcode }}-${{ env.CONFIGURATION }}-
+
+      # Started in the background so the Steam steps below overlap it; "Wait
+      # for Madeira.app" collects the result. If the build with compilation
+      # caching fails, it is retried once without it.
+      - name: Start Madeira.app build
         run: |
           set -eux
           bash build/stage-licenses.sh || true
           mkdir -p app/Madeira/x86_64-vcruntime
-          xcodebuild -project app/Madeira.xcodeproj -target Madeira \
-              -configuration "$CONFIGURATION" -sdk iphoneos \
-              SYMROOT="$PWD/app/build" \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
-              build > xcodebuild.log 2>&1 \
-            || { grep -E "error:|Undefined symbols|referenced from" -A3 xcodebuild.log | head -300; tail -50 xcodebuild.log; exit 1; }
-          tail -5 xcodebuild.log
+          cat > "$RUNNER_TEMP/xcbuild.sh" <<'SH'
+          xcb() {
+            xcodebuild -project app/Madeira.xcodeproj -target Madeira \
+                -configuration "$CONFIGURATION" -sdk iphoneos \
+                SYMROOT="$PWD/app/build" COMPILER_INDEX_STORE_ENABLE=NO \
+                CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+                "$@" build -showBuildTimingSummary > xcodebuild.log 2>&1
+          }
+          if xcb COMPILATION_CACHE_ENABLE_CACHING=YES COMPILATION_CACHE_CAS_PATH="$PWD/app/xc-cas"; then
+            echo 0 > "$RUNNER_TEMP/xcbuild.rc"
+          else
+            mv xcodebuild.log xcodebuild-cas.log
+            rm -rf app/build
+            xcb
+            echo $? > "$RUNNER_TEMP/xcbuild.rc"
+          fi
+          SH
+          rm -f "$RUNNER_TEMP/xcbuild.rc"
+          nohup bash "$RUNNER_TEMP/xcbuild.sh" > /dev/null 2>&1 &
 
       # Pushes have no inputs, so an unset bundle_steam means "bundle".
       # The app copies Madeira.app/Steam into C:\Program Files (x86)\Steam
       # the first time "Steam Testing" is pressed (prepareSteamLaunch()).
       # Cached as a ready zip of Payload/Madeira.app/Steam per Steam manifest;
-      # Package IPA adds the app to a copy of it.
+      # Package IPA adds the app to a copy of it. If the CDN is slow the
+      # newest cached client is used.
       - name: Steam manifest
         if: format('{0}', inputs.bundle_steam) != 'false'
         id: steam
         run: |
           set -eu
-          curl -fsS --retry 3 -o "$RUNNER_TEMP/steam_client_win64" https://media.steampowered.com/client/steam_client_win64
-          echo "hash=$(shasum -a 256 "$RUNNER_TEMP/steam_client_win64" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          if curl -fsS --max-time 10 --retry 2 -o "$RUNNER_TEMP/steam_client_win64" \
+               https://media.steampowered.com/client/steam_client_win64; then
+            echo "hash=$(shasum -a 256 "$RUNNER_TEMP/steam_client_win64" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Steam manifest unavailable; using the newest cached client"
+            echo "hash=unknown" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Restore Steam client
         if: format('{0}', inputs.bundle_steam) != 'false'
@@ -435,9 +473,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/steam-payload
           key: steam-v1-${{ steps.steam.outputs.hash }}-${{ hashFiles('scripts/fetch-steam.sh') }}
+          restore-keys: steam-v1-
 
       - name: Fetch Steam client
-        if: format('{0}', inputs.bundle_steam) != 'false' && steps.steam-cache.outputs.cache-hit != 'true'
+        if: >-
+          format('{0}', inputs.bundle_steam) != 'false' && steps.steam-cache.outputs.cache-hit != 'true'
+          && !(steps.steam.outputs.hash == 'unknown' && steps.steam-cache.outputs.cache-matched-key != '')
         run: |
           set -eux
           P="$RUNNER_TEMP/steam-payload"
@@ -449,11 +490,40 @@ jobs:
           ls -lh "$P"
 
       - name: Save Steam client
-        if: format('{0}', inputs.bundle_steam) != 'false' && steps.steam-cache.outputs.cache-hit != 'true'
+        if: >-
+          format('{0}', inputs.bundle_steam) != 'false' && steps.steam-cache.outputs.cache-hit != 'true'
+          && steps.steam.outputs.hash != 'unknown'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/steam-payload
           key: steam-v1-${{ steps.steam.outputs.hash }}-${{ hashFiles('scripts/fetch-steam.sh') }}
+
+      - name: Wait for Madeira.app
+        id: app
+        timeout-minutes: 30
+        run: |
+          set -eu
+          while [ ! -f "$RUNNER_TEMP/xcbuild.rc" ]; do sleep 1; done
+          rc=$(cat "$RUNNER_TEMP/xcbuild.rc")
+          if [ -f xcodebuild-cas.log ]; then
+            echo "::warning::build with compilation caching failed; rebuilt without it"
+            grep -E "error:" -A3 xcodebuild-cas.log | head -40 || true
+          fi
+          if [ "$rc" != 0 ]; then
+            grep -E "error:|Undefined symbols|referenced from" -A3 xcodebuild.log | head -300
+            tail -50 xcodebuild.log
+            exit 1
+          fi
+          sed -n '/Build Timing Summary/,$p' xcodebuild.log | head -25
+          tail -3 xcodebuild.log
+          if [ -d app/xc-cas ]; then echo "cas=1" >> "$GITHUB_OUTPUT"; du -sh app/xc-cas; fi
+
+      - name: Save Xcode compilation cache
+        if: steps.xc-cas.outputs.cache-hit != 'true' && steps.app.outputs.cas == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: app/xc-cas
+          key: xc-cas-v1-${{ steps.keys.outputs.xcode }}-${{ env.CONFIGURATION }}-${{ github.run_id }}
 
       # The app is signed without Steam (an ad-hoc seal; sideloading re-signs
       # the whole bundle anyway), then zipped into a copy of the Steam zip so
@@ -532,6 +602,7 @@ jobs:
           name: build-logs
           path: |
             xcodebuild.log
+            xcodebuild-cas.log
             wine-configure.log
             build/*/obj/*.err
             build/*/obj/err-*.txt
