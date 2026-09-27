@@ -978,20 +978,18 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 
     /* Steam runs a game's first-launch install script through
      *   bin\SteamService.exe /installscript "<...>\runasadmin.vdf" <appid>
-     * SteamService.exe is 32-bit, so the i386 refusal below turns every game
-     * launch into "Error Invalid handle". The scripts only install the VC++
-     * redistributables and DirectX, which this port replaces with builtin DLLs
-     * and DXMT, so run a 64-bit no-op in its place (cmd.exe /c exit 0): Steam
-     * sees the script process exit 0 and goes on to start the game. */
+     * SteamService.exe is 32-bit, so the i386 refusal below turned every game
+     * launch into "Error Invalid handle". Run our 64-bit stand-in
+     * (build/steamservice) with the same arguments instead: it writes the
+     * script's registry entries, marks the redistributable installers as run
+     * (those libraries are builtin here), and exits 0. */
     {
         static const char svc[] = "steamservice.exe";
         static const char isw[] = "/installscript";
-        static WCHAR nt_cmd[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
-                                 's','y','s','t','e','m','3','2','\\','c','m','d','.','e','x','e',0};
-        static WCHAR dos_cmd[] = {'C',':','\\','w','i','n','d','o','w','s','\\','s','y','s','t','e','m','3','2','\\',
-                                  'c','m','d','.','e','x','e',0};
-        static WCHAR noop_cl[] = {'C',':','\\','w','i','n','d','o','w','s','\\','s','y','s','t','e','m','3','2','\\',
-                                  'c','m','d','.','e','x','e',' ','/','c',' ','e','x','i','t',' ','0',0};
+        static WCHAR nt_exe[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
+                                 's','y','s','t','e','m','3','2','\\','s','t','e','a','m','s','e','r','v','i','c','e',
+                                 '-','x','6','4','.','e','x','e',0};
+        const WCHAR *dos_exe = nt_exe + 4;
         const WCHAR *ip = params->ImagePathName.Buffer;
         const WCHAR *cl = params->CommandLine.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
@@ -1020,17 +1018,41 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
         if (is_script)
         {
-            dprintf( 2, "[proc-gate] SteamService /installscript -> cmd.exe /c exit 0 (was %s)\n",
-                     debugstr_us( &params->CommandLine ) );
-            path.Buffer = nt_cmd;
-            path.Length = sizeof(nt_cmd) - sizeof(WCHAR);
-            path.MaximumLength = sizeof(nt_cmd);
-            params->ImagePathName.Buffer = dos_cmd;
-            params->ImagePathName.Length = sizeof(dos_cmd) - sizeof(WCHAR);
-            params->ImagePathName.MaximumLength = sizeof(dos_cmd);
-            params->CommandLine.Buffer = noop_cl;
-            params->CommandLine.Length = sizeof(noop_cl) - sizeof(WCHAR);
-            params->CommandLine.MaximumLength = sizeof(noop_cl);
+            /* keep everything after the program name: /installscript "<file>" <appid> */
+            int exe_len = sizeof(nt_exe) / sizeof(WCHAR) - 1 - 4, args = 0, o = 0;
+            WCHAR *nbuf;
+
+            while (args < cl_len && cl[args] == ' ') args++;
+            if (args < cl_len && cl[args] == '"')
+            {
+                args++;
+                while (args < cl_len && cl[args] != '"') args++;
+                if (args < cl_len) args++;
+            }
+            else while (args < cl_len && cl[args] != ' ') args++;
+
+            nbuf = malloc( (exe_len + 2 + cl_len - args + 1) * sizeof(WCHAR) );
+            if (nbuf)
+            {
+                nbuf[o++] = '"';
+                memcpy( nbuf + o, dos_exe, exe_len * sizeof(WCHAR) );
+                o += exe_len;
+                nbuf[o++] = '"';
+                memcpy( nbuf + o, cl + args, (cl_len - args) * sizeof(WCHAR) );
+                o += cl_len - args;
+                nbuf[o] = 0;
+                dprintf( 2, "[proc-gate] SteamService /installscript -> steamservice-x64.exe (was %s)\n",
+                         debugstr_us( &params->CommandLine ) );
+                path.Buffer = nt_exe;
+                path.Length = sizeof(nt_exe) - sizeof(WCHAR);
+                path.MaximumLength = sizeof(nt_exe);
+                params->ImagePathName.Buffer = (WCHAR *)dos_exe;
+                params->ImagePathName.Length = exe_len * sizeof(WCHAR);
+                params->ImagePathName.MaximumLength = params->ImagePathName.Length + sizeof(WCHAR);
+                params->CommandLine.Buffer = nbuf;
+                params->CommandLine.Length = o * sizeof(WCHAR);
+                params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+            }
         }
     }
 
