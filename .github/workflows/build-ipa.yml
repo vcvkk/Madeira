@@ -101,6 +101,12 @@ jobs:
             !FEX/build-ios/**/*.o
           key: native-${{ env.NATIVE_CACHE_VERSION }}-${{ steps.keys.outputs.xcode }}-${{ steps.keys.outputs.subs }}-${{ hashFiles('build/**', '!build/steamservice/**', '!build/proc-tests/**', '!build/x64-tests/**', '!build/d3d11-triangle/**', '!build/dxmt-tests/**', '!build/host-tests/**', '!build/net-tests/**', '!build/wine-pe/**', '!build/fex-arm64ec/**', 'research/madeira-d3d12/**', 'scripts/ci/**') }}
 
+      # The FEX gitfile can come back from the cache and points at a
+      # .git/modules/FEX this checkout does not have.
+      - name: Drop restored FEX gitfile
+        if: steps.native.outputs.cache-hit == 'true'
+        run: rm -rf FEX/.git
+
       # Everything from here to "Save native libraries" runs only on a miss.
       - name: Restore submodule objects
         if: steps.native.outputs.cache-hit != 'true'
