@@ -279,6 +279,7 @@ jobs:
         run: |
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          python3 scripts/ci/patch-wine-ios.py
           bash scripts/ci/build-wineserver-base.sh
           bash build/wineserver/build.sh all
           test -s app/Madeira/libwineserver.a
