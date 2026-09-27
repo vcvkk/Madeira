@@ -1334,6 +1334,21 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
         goto done;
     }
+    /* No 32-bit x86 child can run under this port (see the ml410 note above:
+     * build_wow64_parameters needs memory below 2GB, which the 4GB iOS page
+     * zero makes unmappable). The child's init thread then fails the
+     * `!status` assertion and abort() takes the whole app down. The name gate
+     * above only knew a few such helpers; Steam also runs bin\SteamService.exe
+     * (i386) as "/installscript" on a game's first launch, so every game
+     * crashed the app at "Running install script". Refuse any i386 image the
+     * way 64-bit Windows without WoW64 does, so the caller gets an error. */
+    if (pe_info.machine == IMAGE_FILE_MACHINE_I386)
+    {
+        dprintf( 2, "[proc-gate] REFUSING 32-bit x86 image %s (no WoW64 on this port)\n",
+                 debugstr_us( &params->ImagePathName ) );
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
     if (!machine)
     {
         /* Owner-aware (X3): the SPAWNER's identity decides hybrid-image
