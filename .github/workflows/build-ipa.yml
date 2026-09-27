@@ -39,6 +39,9 @@ env:
   LLVM_VERSION: 15.0.7
   FREETYPE_TAG: VER-2-13-3
   CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+  # Bump when a native build step below changes in a way the hashed files
+  # (see the "native" cache key) do not capture.
+  NATIVE_CACHE_VERSION: v1
 
 # contents: write lets the job create the release (the default token may be
 # read-only).
@@ -52,54 +55,118 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Submodules by hand so FEX's test-binary repos and Catch2 (unused with
-      # BUILD_TESTING=OFF, and the bulk of the download) are skipped.
-      - name: Submodules
-        run: |
-          set -eux
-          git submodule update --init --depth 1 wine research/dxmt FEX
-          git -C wine submodule update --init --recursive --depth 1
-          git -C research/dxmt submodule update --init --recursive --depth 1
-          git -C FEX \
-            -c submodule.External/fex-posixtest-bins.update=none \
-            -c submodule.External/fex-gvisor-tests-bins.update=none \
-            -c submodule.External/fex-gcc-target-tests-bins.update=none \
-            -c submodule.External/Catch2.update=none \
-            submodule update --init --recursive --depth 1
-          git submodule status --recursive | grep -v '^-' | head -40
-
       # ContentView.swift uses glassEffect (iOS 26 SDK), so Xcode 16 cannot
       # compile the app. Pick the newest Xcode 26+ on the image.
       - name: Select Xcode 26
         run: |
           set -eu
-          ls -d /Applications/Xcode*.app
           X=$(ls -d /Applications/Xcode_2[6-9]*.app 2>/dev/null | sort -V | tail -1 || true)
-          [ -n "$X" ] || { echo "::error::No Xcode 26+ on this runner image"; exit 1; }
+          [ -n "$X" ] || { ls -d /Applications/Xcode*.app; echo "::error::No Xcode 26+ on this runner image"; exit 1; }
           sudo xcode-select -s "$X/Contents/Developer"
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          # DXMT's airconv shaders need the Metal compiler, a separate
-          # download since Xcode 26.
+
+      # Caching, fastest path first:
+      #  - "native": the unix-side static libraries plus FEX (headers and
+      #    libs the app compiles and links against). Keyed by the submodule
+      #    commits and every file the native build reads, so a change that
+      #    only touches the app or the bundled Windows binaries skips the
+      #    submodules, the toolchains and all native builds.
+      #  - On a native miss: submodule git objects, the configured Wine
+      #    headers, FreeType, llvm-mingw, LLVM, GnuTLS and ccache each come
+      #    from their own cache.
+      #  - The Steam client is cached pre-zipped per Steam manifest.
+      - name: Cache keys
+        id: keys
+        run: |
+          set -eu
+          SUBS=$(git ls-tree HEAD wine FEX research/dxmt | awk '{print substr($3,1,12)}' | paste -sd- -)
+          XCODE=$(xcodebuild -version | head -1 | tr -cd '0-9.')
+          echo "subs=$SUBS" >> "$GITHUB_OUTPUT"
+          echo "xcode=$XCODE" >> "$GITHUB_OUTPUT"
+          echo "wine=$(git ls-tree HEAD wine | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "subs=$SUBS xcode=$XCODE"
+
+      - name: Restore native libraries
+        id: native
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwineserver.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libdxmt_combined.a
+            FEX
+            !FEX/.git
+            !FEX/**/.git
+            !FEX/build-ios/**/*.o
+          key: native-${{ env.NATIVE_CACHE_VERSION }}-${{ steps.keys.outputs.xcode }}-${{ steps.keys.outputs.subs }}-${{ hashFiles('build/**', '!build/steamservice/**', '!build/proc-tests/**', '!build/x64-tests/**', '!build/d3d11-triangle/**', '!build/dxmt-tests/**', '!build/host-tests/**', '!build/net-tests/**', '!build/wine-pe/**', '!build/fex-arm64ec/**', 'research/madeira-d3d12/**', 'scripts/ci/**') }}
+
+      # Everything from here to "Save native libraries" runs only on a miss.
+      - name: Restore submodule objects
+        if: steps.native.outputs.cache-hit != 'true'
+        id: submodule-objects
+        uses: actions/cache/restore@v4
+        with:
+          path: .git/modules
+          key: submodules-v1-${{ steps.keys.outputs.subs }}
+
+      # Submodules by hand so FEX's test-binary repos and Catch2 (unused with
+      # BUILD_TESTING=OFF, and the bulk of the download) are skipped. With the
+      # objects restored above this is a local checkout.
+      - name: Submodules
+        if: steps.native.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          git submodule update --init --depth 1 --jobs 3 wine research/dxmt FEX
+          git -C wine submodule update --init --recursive --depth 1 --jobs 4
+          git -C research/dxmt submodule update --init --recursive --depth 1 --jobs 4
+          git -C FEX \
+            -c submodule.External/fex-posixtest-bins.update=none \
+            -c submodule.External/fex-gvisor-tests-bins.update=none \
+            -c submodule.External/fex-gcc-target-tests-bins.update=none \
+            -c submodule.External/Catch2.update=none \
+            submodule update --init --recursive --depth 1 --jobs 4
+          # Restored git dirs carry the previous run's index, so a checkout of
+          # the same commit would leave the (empty) work trees as they are.
+          git submodule foreach --recursive --quiet 'git reset --hard -q'
+          git submodule status --recursive | grep -v '^-' | head -40
+
+      - name: Save submodule objects
+        if: steps.native.outputs.cache-hit != 'true' && steps.submodule-objects.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .git/modules
+          key: submodules-v1-${{ steps.keys.outputs.subs }}
+
+      # DXMT's airconv shaders need the Metal compiler, a separate download
+      # since Xcode 26.
+      - name: Metal toolchain
+        if: steps.native.outputs.cache-hit != 'true'
+        run: |
           xcrun -sdk macosx metal --version 2>/dev/null \
             || sudo xcodebuild -downloadComponent MetalToolchain
           xcrun -sdk macosx metal --version
 
       - name: Restore llvm-mingw
+        if: steps.native.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: ~/llvm-mingw
           key: llvm-mingw-20240619-ucrt-macos-universal
 
       - name: Host tools
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
-          brew install ninja meson bison flex llvm ccache cmake pkg-config
+          # Only what the image lacks (a full `brew install` of the list
+          # re-checks every formula). llvm-objcopy comes from llvm-mingw.
+          missing=""
+          for f in ninja meson bison flex ccache cmake pkg-config; do
+            brew list --versions "$f" >/dev/null 2>&1 || missing="$missing $f"
+          done
+          [ -z "$missing" ] || brew install $missing
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin"  >> "$GITHUB_PATH"
-          mkdir -p "$RUNNER_TEMP/bin"
-          ln -sf "$(brew --prefix llvm)/bin/llvm-objcopy" "$RUNNER_TEMP/bin/llvm-objcopy"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
           # FEX Scripts/aarch64_fit_native.py needs packaging (or pkg_resources)
           # Homebrew Python is externally managed (PEP 668).
@@ -113,6 +180,7 @@ jobs:
             tar -xJf /tmp/llvm-mingw.tar.xz -C "$LM" --strip-components=1
           fi
           test -x "$LM/bin/aarch64-w64-mingw32-clang"
+          test -x "$LM/bin/llvm-objcopy"
           echo "$LM/bin" >> "$GITHUB_PATH"
           export PATH="$LM/bin:$PATH"
           aarch64-w64-mingw32-clang --version | head -1
@@ -120,6 +188,7 @@ jobs:
 
       # One cache entry per run; each run starts from the newest earlier one.
       - name: Compiler cache
+        if: steps.native.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: .ccache
@@ -127,6 +196,7 @@ jobs:
           restore-keys: ccache-${{ runner.os }}-
 
       - name: Route xcrun clang through ccache
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
           mkdir -p "$RUNNER_TEMP/ccache-bin"
@@ -136,6 +206,7 @@ jobs:
           ccache --show-config | grep -E "cache_dir|base_dir|max_size"
 
       - name: Restore LLVM (iOS) cache
+        if: steps.native.outputs.cache-hit != 'true'
         id: llvm-cache
         uses: actions/cache/restore@v4
         with:
@@ -146,7 +217,7 @@ jobs:
           key: llvm-ios-${{ env.LLVM_VERSION }}-v1
 
       - name: Build LLVM ${{ env.LLVM_VERSION }} for iOS
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        if: steps.native.outputs.cache-hit != 'true' && steps.llvm-cache.outputs.cache-hit != 'true'
         run: |
           set -eux
           mkdir -p toolchains && cd toolchains
@@ -172,7 +243,7 @@ jobs:
           ls llvm-ios-build/lib/*.a | wc -l
 
       - name: Save LLVM (iOS) cache
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        if: steps.native.outputs.cache-hit != 'true' && steps.llvm-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -182,6 +253,7 @@ jobs:
           key: llvm-ios-${{ env.LLVM_VERSION }}-v1
 
       - name: Restore GnuTLS cache
+        if: steps.native.outputs.cache-hit != 'true'
         id: gnutls-cache
         uses: actions/cache/restore@v4
         with:
@@ -189,17 +261,29 @@ jobs:
           key: gnutls-ios-${{ hashFiles('build/gnutls-ios/build.sh', 'build/gnutls-ios/src/SHA256SUMS') }}
 
       - name: Build GnuTLS stack
-        if: steps.gnutls-cache.outputs.cache-hit != 'true'
+        if: steps.native.outputs.cache-hit != 'true' && steps.gnutls-cache.outputs.cache-hit != 'true'
         run: bash build/gnutls-ios/build.sh
 
       - name: Save GnuTLS cache
-        if: steps.gnutls-cache.outputs.cache-hit != 'true'
+        if: steps.native.outputs.cache-hit != 'true' && steps.gnutls-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: toolchains/gnutls-ios
           key: gnutls-ios-${{ hashFiles('build/gnutls-ios/build.sh', 'build/gnutls-ios/src/SHA256SUMS') }}
 
+      - name: Restore FreeType
+        if: steps.native.outputs.cache-hit != 'true'
+        id: freetype
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            research/freetype
+            build/freetype-ios/build/libfreetype.a
+            build/freetype-ios/build/include
+          key: freetype-${{ env.FREETYPE_TAG }}-${{ steps.keys.outputs.xcode }}-${{ hashFiles('build/freetype-ios/build.sh') }}
+
       - name: Build FreeType
+        if: steps.native.outputs.cache-hit != 'true' && steps.freetype.outputs.cache-hit != 'true'
         run: |
           set -eux
           rm -rf research/freetype
@@ -208,45 +292,44 @@ jobs:
           test -d research/freetype
           bash build/freetype-ios/build.sh
 
+      - name: Save FreeType
+        if: steps.native.outputs.cache-hit != 'true' && steps.freetype.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            research/freetype
+            build/freetype-ios/build/libfreetype.a
+            build/freetype-ios/build/include
+          key: freetype-${{ env.FREETYPE_TAG }}-${{ steps.keys.outputs.xcode }}-${{ hashFiles('build/freetype-ios/build.sh') }}
+
+      - name: Restore Wine host headers
+        if: steps.native.outputs.cache-hit != 'true'
+        id: wine-cfg
+        uses: actions/cache/restore@v4
+        with:
+          path: wine/build-macos
+          key: wine-cfg-v1-${{ steps.keys.outputs.xcode }}-${{ steps.keys.outputs.wine }}-${{ hashFiles('scripts/ci/configure-wine.sh') }}
+
       - name: Configure Wine (host headers)
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
-          which aarch64-w64-mingw32-clang
-
-          if [ ! -f wine/dlls/ntdll/arm64ec_x64_export_iat.c ]; then
-            printf '%s\n' '/* generated during PE build; empty for host configure */' \
-              > wine/dlls/ntdll/arm64ec_x64_export_iat.c
-          fi
-
-          # The fork includes build/madeira_cfg.h ahead of config.h on purpose
-          # (ml1122); makedep's include-order sanity check rejects that and
-          # configure then writes no Makefile. Drop the check in CI only.
-          sed -i '' 's/fatal_error( "%s must be included before other headers\\n", file->name );/;/' wine/tools/makedep.c
-          ! grep -q 'must be included before other headers\\n", file->name' wine/tools/makedep.c
-
-          mkdir -p wine/build-macos && cd wine/build-macos
-          set +e
-          ../configure --without-x --without-freetype --disable-tests --with-mingw=clang \
-            > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1
-          cfg=$?
-          set -e
-          tail -40 "$GITHUB_WORKSPACE/wine-configure.log" || true
-          test -f include/config.h
-
-          if [ -f Makefile ]; then
-            make -j"$(sysctl -n hw.ncpu)" include/all || make -C include all || true
+          if [ "${{ steps.wine-cfg.outputs.cache-hit }}" = "true" ]; then
+            bash scripts/ci/configure-wine.sh --sources
           else
-            echo "::warning::Wine Makefile missing (makedep exit); using config.h only"
-            mkdir -p include
-            touch include/stamp-h
+            bash scripts/ci/configure-wine.sh
           fi
 
-          cd .. && ln -sfn build-macos build-arm64ec
-          test -f build-macos/include/config.h
-          ls -la build-macos/include/config.h
+      - name: Save Wine host headers
+        if: steps.native.outputs.cache-hit != 'true' && steps.wine-cfg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: wine/build-macos
+          key: wine-cfg-v1-${{ steps.keys.outputs.xcode }}-${{ steps.keys.outputs.wine }}-${{ hashFiles('scripts/ci/configure-wine.sh') }}
 
       - name: Build FEXCore
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
           # Ensure packaging is importable for FEX scripts
@@ -260,6 +343,7 @@ jobs:
           }
 
       - name: Build libntdll_unix.a
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
@@ -276,6 +360,7 @@ jobs:
           test -s app/Madeira/libntdll_unix.a
 
       - name: Build libwineserver.a
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
@@ -285,6 +370,7 @@ jobs:
           test -s app/Madeira/libwineserver.a
 
       - name: Build libwin32u_unix.a
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
           export PATH="$HOME/llvm-mingw/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
@@ -292,6 +378,7 @@ jobs:
           test -s app/Madeira/libwin32u_unix.a
 
       - name: Build libdxmt_combined.a
+        if: steps.native.outputs.cache-hit != 'true'
         run: |
           set -eux
           bash build/dxmt-ios/build.sh
@@ -299,6 +386,21 @@ jobs:
               build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
           cp build/dxmt-ios/libdxmt_combined.a app/Madeira/
           test -s app/Madeira/libdxmt_combined.a
+
+      - name: Save native libraries
+        if: steps.native.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwineserver.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libdxmt_combined.a
+            FEX
+            !FEX/.git
+            !FEX/**/.git
+            !FEX/build-ios/**/*.o
+          key: ${{ steps.native.outputs.cache-primary-key }}
 
       - name: Build Madeira.app
         run: |
@@ -316,29 +418,60 @@ jobs:
       # Pushes have no inputs, so an unset bundle_steam means "bundle".
       # The app copies Madeira.app/Steam into C:\Program Files (x86)\Steam
       # the first time "Steam Testing" is pressed (prepareSteamLaunch()).
-      - name: Fetch Steam client
+      # Cached as a ready zip of Payload/Madeira.app/Steam per Steam manifest;
+      # Package IPA adds the app to a copy of it.
+      - name: Steam manifest
         if: format('{0}', inputs.bundle_steam) != 'false'
-        run: bash scripts/fetch-steam.sh "$RUNNER_TEMP/Steam"
+        id: steam
+        run: |
+          set -eu
+          curl -fsS --retry 3 -o "$RUNNER_TEMP/steam_client_win64" https://media.steampowered.com/client/steam_client_win64
+          echo "hash=$(shasum -a 256 "$RUNNER_TEMP/steam_client_win64" | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
+      - name: Restore Steam client
+        if: format('{0}', inputs.bundle_steam) != 'false'
+        id: steam-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/steam-payload
+          key: steam-v1-${{ steps.steam.outputs.hash }}-${{ hashFiles('scripts/fetch-steam.sh') }}
+
+      - name: Fetch Steam client
+        if: format('{0}', inputs.bundle_steam) != 'false' && steps.steam-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          P="$RUNNER_TEMP/steam-payload"
+          rm -rf "$P" && mkdir -p "$P/Payload/Madeira.app"
+          bash scripts/fetch-steam.sh "$P/Payload/Madeira.app/Steam"
+          cp "$P/Payload/Madeira.app/Steam/package/steam_client_win64.manifest" "$P/"
+          (cd "$P" && zip -qry -1 steam.zip Payload)
+          rm -rf "$P/Payload"
+          ls -lh "$P"
+
+      - name: Save Steam client
+        if: format('{0}', inputs.bundle_steam) != 'false' && steps.steam-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/steam-payload
+          key: steam-v1-${{ steps.steam.outputs.hash }}-${{ hashFiles('scripts/fetch-steam.sh') }}
+
+      # The app is signed without Steam (an ad-hoc seal; sideloading re-signs
+      # the whole bundle anyway), then zipped into a copy of the Steam zip so
+      # only the app itself is compressed on each run.
       - name: Package IPA
         run: |
           set -eux
           APP="app/build/$CONFIGURATION-iphoneos/Madeira.app"
-          if [ -d "$RUNNER_TEMP/Steam" ]; then
-            rm -rf "$APP/Steam"
-            cp -R "$RUNNER_TEMP/Steam" "$APP/Steam"
-          fi
+          IPA="$PWD/Madeira-$CONFIGURATION-unsigned.ipa"
+          rm -rf "$APP/Steam" "$IPA"
           codesign --force --sign - --entitlements app/Madeira/Madeira.entitlements "$APP" || true
+          STEAM_ZIP="$RUNNER_TEMP/steam-payload/steam.zip"
+          [ ! -f "$STEAM_ZIP" ] || cp "$STEAM_ZIP" "$IPA"
           rm -rf ipa && mkdir -p ipa/Payload
-          cp -R "$APP" ipa/Payload/
-          (cd ipa && zip -qry -1 "../Madeira-$CONFIGURATION-unsigned.ipa" Payload)
-          ls -lh Madeira-*.ipa
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Madeira-${{ env.CONFIGURATION }}-ipa
-          path: Madeira-*.ipa
-          compression-level: 0
+          mv "$APP" ipa/Payload/
+          (cd ipa && zip -qry -1 "$IPA" Payload)
+          unzip -l "$IPA" | tail -1
+          ls -lh "$IPA"
 
       # Every successful build becomes a release tagged build-<run number> on
       # the built commit. Only main builds are full releases (and "Latest");
@@ -350,9 +483,9 @@ jobs:
           set -eux
           TAG="build-${GITHUB_RUN_NUMBER}"
           STEAM_NOTE="no Steam"
-          if [ -f "$RUNNER_TEMP/Steam/package/steam_client_win64.manifest" ]; then
+          if [ -f "$RUNNER_TEMP/steam-payload/steam_client_win64.manifest" ]; then
             STEAM_NOTE="Steam client $(sed -n 's/^[[:space:]]*"version"[[:space:]]*"\([0-9]*\)".*/\1/p' \
-              "$RUNNER_TEMP/Steam/package/steam_client_win64.manifest" | head -1)"
+              "$RUNNER_TEMP/steam-payload/steam_client_win64.manifest" | head -1)"
           fi
           PRERELEASE=""
           [ "$GITHUB_REF" = "refs/heads/main" ] || PRERELEASE="--prerelease"
@@ -381,7 +514,7 @@ jobs:
           done
 
       - name: Compiler cache stats
-        if: always()
+        if: always() && steps.native.outputs.cache-hit != 'true'
         run: ccache --show-stats || true
 
       - name: Show compiler errors
