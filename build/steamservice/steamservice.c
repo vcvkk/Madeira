@@ -1,4 +1,4 @@
-/* steamservice-x64.exe -- a 64-bit stand-in for Steam's install-script runner.
+/* steamservice-arm64.exe -- a native stand-in for Steam's install-script runner.
  *
  * On a game's first launch Steam evaluates the game's install script and
  * hands the parts that need admin rights to
@@ -6,6 +6,8 @@
  * SteamService.exe is 32-bit x86, and a 32-bit process cannot run under this
  * port (WoW64 needs memory below 2GB, which the iOS 4GB page zero takes), so
  * NtCreateUserProcess redirects that one command line here (process_ios.c).
+ * It ships as native ARM64 (see build.sh for why not x64); the same source
+ * builds as steamservice-x64.exe for test.sh under a desktop Wine.
  *
  * What the script asks for, and what this does with it:
  *   "Registry"                 -- written, the way SteamService writes it
@@ -581,6 +583,6 @@ int wmain( void )
     }
     /* Any other SteamService verb (/uninstallscript, /repair, ...): nothing to
      * do in this port, and Steam only needs it to have succeeded. */
-    fwprintf( stderr, L"steamservice-x64: nothing to do for %ls\n", GetCommandLineW() );
+    fwprintf( stderr, L"steamservice: nothing to do for %ls\n", GetCommandLineW() );
     return 0;
 }

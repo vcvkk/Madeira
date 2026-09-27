@@ -1,6 +1,7 @@
 #!/bin/bash
-# Runs steamservice-x64.exe under a desktop Wine against a sample install
-# script and checks the registry it leaves behind. Needs wine (64-bit).
+# Runs steamservice-x64.exe (the x64 build of the shipped steamservice-arm64.exe;
+# run build.sh first) under a desktop Wine against a sample install script and
+# checks the registry it leaves behind. Needs wine (64-bit).
 # Usage: build/steamservice/test.sh
 set -u
 

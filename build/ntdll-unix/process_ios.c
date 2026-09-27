@@ -979,16 +979,19 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     /* Steam runs a game's first-launch install script through
      *   bin\SteamService.exe /installscript "<...>\runasadmin.vdf" <appid>
      * SteamService.exe is 32-bit, so the i386 refusal below turned every game
-     * launch into "Error Invalid handle". Run our 64-bit stand-in
-     * (build/steamservice) with the same arguments instead: it writes the
-     * script's registry entries, marks the redistributable installers as run
-     * (those libraries are builtin here), and exits 0. */
+     * launch into "Error Invalid handle". Run our stand-in (build/steamservice)
+     * with the same arguments instead: it writes the script's registry
+     * entries, marks the redistributable installers as run (those libraries
+     * are builtin here), and exits 0. It is native ARM64, not x64: an x64
+     * child that exits leaves its private ntdll/FEX mappings behind, and the
+     * game Steam starts right after the script then failed to load FEX
+     * (jump to NULL in load_arm64ec_module, "Launching executable" forever). */
     {
         static const char svc[] = "steamservice.exe";
         static const char isw[] = "/installscript";
         static WCHAR nt_exe[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
                                  's','y','s','t','e','m','3','2','\\','s','t','e','a','m','s','e','r','v','i','c','e',
-                                 '-','x','6','4','.','e','x','e',0};
+                                 '-','a','r','m','6','4','.','e','x','e',0};
         const WCHAR *dos_exe = nt_exe + 4;
         const WCHAR *ip = params->ImagePathName.Buffer;
         const WCHAR *cl = params->CommandLine.Buffer;
@@ -1041,7 +1044,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                 memcpy( nbuf + o, cl + args, (cl_len - args) * sizeof(WCHAR) );
                 o += cl_len - args;
                 nbuf[o] = 0;
-                dprintf( 2, "[proc-gate] SteamService /installscript -> steamservice-x64.exe (was %s)\n",
+                dprintf( 2, "[proc-gate] SteamService /installscript -> steamservice-arm64.exe (was %s)\n",
                          debugstr_us( &params->CommandLine ) );
                 path.Buffer = nt_exe;
                 path.Length = sizeof(nt_exe) - sizeof(WCHAR);
